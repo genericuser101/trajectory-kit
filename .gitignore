@@ -1,0 +1,22 @@
+# Test
+tests/test_paths.json
+.pytest_cache/
+
+# Development
+# you can see what I am doing
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Build
+dist/
+build/
+
+# Environment
+.env_MD/
+.env/
+venv/
