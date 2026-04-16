@@ -3,7 +3,8 @@ tests/test_paths.json
 .pytest_cache/
 
 # Development
-# you can see what I am doing
+tests/*
+developer/*
 
 # Python
 __pycache__/
