@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 
 # local imports
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 
 # =========================================================================
@@ -563,16 +563,15 @@ def _plan_type_query_mae(
             f'Available requests: {sorted(requests_available)}'
         )
 
-    output_kind, trailing_shape, bytes_per_match = _get_mae_type_request_plan_shape(request_string)
+    output_kind, trailing_shape, bytes_per_match = _get_type_plan_shape_mae(request_string)
 
+    # Scalar property requests are short-circuited centrally by
+    # _plan_domain_request via the plan_shape function. Defensive only.
     if output_kind == 'scalar_property':
         return {
             'planner_mode': 'stochastic',
-            'file_type':    'mae',
-            'request':      request_string,
             'supported':    False,
             'reason':       f'{request_string!r} is a scalar property, not estimated.',
-            'query_dictionary': query_dictionary,
         }
 
     SAMPLE_SIZE     = 500
@@ -587,7 +586,12 @@ def _plan_type_query_mae(
 
     n_total = sum(ct_sizes)
     if n_total == 0:
-        return {'planner_mode': 'stochastic', 'n_atoms': 0, 'confidence': 'none'}
+        return {
+            'planner_mode': 'stochastic',
+            'n_atoms':      0,
+            'n_frames':     1,
+            'confidence':   'none',
+        }
 
     # Allocate sample budget proportionally across CTs — minimum 1 per CT
     ct_budgets: list[int] = [
@@ -617,11 +621,15 @@ def _plan_type_query_mae(
         ct_count += 1
 
     if n_sampled == 0:
-        return {'planner_mode': 'stochastic', 'n_atoms': 0, 'confidence': 'none'}
+        return {
+            'planner_mode': 'stochastic',
+            'n_atoms':      0,
+            'n_frames':     1,
+            'confidence':   'none',
+        }
 
     match_frac        = n_matched / n_sampled
     estimated_matches = int(round(n_total * match_frac))
-    estimated_bytes   = estimated_matches * bytes_per_match
 
     confidence = (
         'none'   if n_matched == 0  else
@@ -635,8 +643,7 @@ def _plan_type_query_mae(
         'n_atoms_sampled': n_sampled,
         'n_atoms_matched': n_matched,
         'n_atoms':         estimated_matches,
-        'estimated_bytes': estimated_bytes,
-        'estimated_mib':   estimated_bytes / (1024 ** 2),
+        'n_frames':        1,
         'confidence':      confidence,
     }
 
@@ -921,6 +928,7 @@ def _get_m_atom_predicate(query_dictionary: dict) -> dict:
 
     # integer / float range fields
     
+    gid_inc,     gid_exc     = _r('global_ids')
     li_inc,      li_exc      = _r('local_ids')
     ri_inc,      ri_exc      = _r('residue_ids')
     anum_inc,    anum_exc    = _r('atomic_number')
@@ -952,6 +960,7 @@ def _get_m_atom_predicate(query_dictionary: dict) -> dict:
         'mres_inc': mres_inc,  'mres_exc': mres_exc,
         'grow_inc': grow_inc,  'grow_exc': grow_exc,
         'ins_inc':  ins_inc,   'ins_exc':  ins_exc,
+        'gid_inc':  gid_inc,   'gid_exc':  gid_exc,
         'li_inc':   li_inc,    'li_exc':   li_exc,
         'ri_inc':   ri_inc,    'ri_exc':   ri_exc,
         'anum_inc': anum_inc,  'anum_exc': anum_exc,
@@ -973,7 +982,7 @@ def _get_m_atom_predicate(query_dictionary: dict) -> dict:
         'vx_inc':   vx_inc,    'vx_exc':   vx_exc,
         'vy_inc':   vy_inc,    'vy_exc':   vy_exc,
         'vz_inc':   vz_inc,    'vz_exc':   vz_exc,
-        # need flags
+        # need flags — True iff the field's normalised pair is non-empty
         'need_atom':  bool(atom_inc  or atom_exc),
         'need_atf':   bool(atf_inc   or atf_exc),
         'need_resn':  bool(resn_inc  or resn_exc),
@@ -982,27 +991,28 @@ def _get_m_atom_predicate(query_dictionary: dict) -> dict:
         'need_mres':  bool(mres_inc  or mres_exc),
         'need_grow':  bool(grow_inc  or grow_exc),
         'need_ins':   bool(ins_inc   or ins_exc),
-        'need_li':    li_inc    != (None, None) or li_exc    != (None, None),
-        'need_ri':    ri_inc    != (None, None) or ri_exc    != (None, None),
-        'need_anum':  anum_inc  != (None, None) or anum_exc  != (None, None),
-        'need_mtype': mtype_inc != (None, None) or mtype_exc != (None, None),
-        'need_color': color_inc != (None, None) or color_exc != (None, None),
-        'need_vis':   vis_inc   != (None, None) or vis_exc   != (None, None),
-        'need_fchg':  fchg_inc  != (None, None) or fchg_exc  != (None, None),
-        'need_pc1':   pc1_inc   != (None, None) or pc1_exc   != (None, None),
-        'need_pc2':   pc2_inc   != (None, None) or pc2_exc   != (None, None),
-        'need_ss':    ss_inc    != (None, None) or ss_exc    != (None, None),
-        'need_tfac':  tfac_inc  != (None, None) or tfac_exc  != (None, None),
-        'need_occ':   occ_inc   != (None, None) or occ_exc   != (None, None),
-        'need_hc':    hc_inc    != (None, None) or hc_exc    != (None, None),
-        'need_repr':  repr_inc  != (None, None) or repr_exc  != (None, None),
-        'need_tmpl':  tmpl_inc  != (None, None) or tmpl_exc  != (None, None),
-        'need_x':     x_inc     != (None, None) or x_exc     != (None, None),
-        'need_y':     y_inc     != (None, None) or y_exc     != (None, None),
-        'need_z':     z_inc     != (None, None) or z_exc     != (None, None),
-        'need_vx':    vx_inc    != (None, None) or vx_exc    != (None, None),
-        'need_vy':    vy_inc    != (None, None) or vy_exc    != (None, None),
-        'need_vz':    vz_inc    != (None, None) or vz_exc    != (None, None),
+        'need_gid':   bool(gid_inc   or gid_exc),
+        'need_li':    bool(li_inc    or li_exc),
+        'need_ri':    bool(ri_inc    or ri_exc),
+        'need_anum':  bool(anum_inc  or anum_exc),
+        'need_mtype': bool(mtype_inc or mtype_exc),
+        'need_color': bool(color_inc or color_exc),
+        'need_vis':   bool(vis_inc   or vis_exc),
+        'need_fchg':  bool(fchg_inc  or fchg_exc),
+        'need_pc1':   bool(pc1_inc   or pc1_exc),
+        'need_pc2':   bool(pc2_inc   or pc2_exc),
+        'need_ss':    bool(ss_inc    or ss_exc),
+        'need_tfac':  bool(tfac_inc  or tfac_exc),
+        'need_occ':   bool(occ_inc   or occ_exc),
+        'need_hc':    bool(hc_inc    or hc_exc),
+        'need_repr':  bool(repr_inc  or repr_exc),
+        'need_tmpl':  bool(tmpl_inc  or tmpl_exc),
+        'need_x':     bool(x_inc     or x_exc),
+        'need_y':     bool(y_inc     or y_exc),
+        'need_z':     bool(z_inc     or z_exc),
+        'need_vx':    bool(vx_inc    or vx_exc),
+        'need_vy':    bool(vy_inc    or vy_exc),
+        'need_vz':    bool(vz_inc    or vz_exc),
     }
 
 
@@ -1027,8 +1037,11 @@ def _does_m_atom_query_match(atom: dict, predicate_state: dict) -> bool:
     ps = predicate_state
     ok = True
 
-    # Integer range checks first (cheapest for most queries)
-    if ps['need_li']:    ok = mr(atom['local_id'],            ps['li_inc'],    ps['li_exc'])
+    # global_ids first: most selective, exact integer id match
+    if ps['need_gid']:   ok = mr(atom['global_id'],           ps['gid_inc'],   ps['gid_exc'])
+
+    # Integer range checks next (cheapest for most queries)
+    if ok and ps['need_li']:    ok = mr(atom['local_id'],            ps['li_inc'],    ps['li_exc'])
     if ok and ps['need_ri']:    ok = mr(atom['residue_id'],   ps['ri_inc'],    ps['ri_exc'])
     if ok and ps['need_anum']:  ok = mr(atom['atomic_number'], ps['anum_inc'], ps['anum_exc'])
     if ok and ps['need_mtype']: ok = mr(atom['mmod_type'],    ps['mtype_inc'], ps['mtype_exc'])
@@ -1064,7 +1077,7 @@ def _does_m_atom_query_match(atom: dict, predicate_state: dict) -> bool:
 
 
 # size of the plan
-def _get_mae_type_request_plan_shape(request_string: str) -> tuple[str, tuple, int | None]:
+def _get_type_plan_shape_mae(request_string: str) -> tuple[str, tuple, int | None]:
 
     '''
     Return (output_kind, trailing_shape, bytes_per_match) for the typing planner.
@@ -1307,16 +1320,15 @@ def _plan_topology_query_mae(
             f'Available requests: {sorted(requests_available)}'
         )
 
-    output_kind, trailing_shape, bytes_per_match = _get_mae_topo_request_plan_shape(request_string)
+    output_kind, trailing_shape, bytes_per_match = _get_topology_plan_shape_mae(request_string)
 
+    # Scalar property requests are short-circuited centrally by
+    # _plan_domain_request via the plan_shape function. Defensive only.
     if output_kind == 'scalar_property':
         return {
             'planner_mode': 'stochastic',
-            'file_type':    'mae',
-            'request':      request_string,
             'supported':    False,
             'reason':       f'{request_string!r} is a scalar property, not estimated.',
-            'query_dictionary': query_dictionary,
         }
 
     # Strip bonded_with before passing to typing planner — bonds are not
@@ -1335,14 +1347,10 @@ def _plan_topology_query_mae(
         requests_available=type_reqs,
     )
 
-    # Re-apply the topology bytes-per-match for the actual request
-    estimated_matches = type_plan.get('n_atoms', 0)
-    estimated_bytes   = estimated_matches * bytes_per_match
-
+    # type_plan already carries planner_mode, n_atoms, n_frames=1, sampling
+    # info, and confidence. Just append topology-specific notes.
     return {
         **type_plan,
-        'estimated_bytes': estimated_bytes,
-        'estimated_mib':   estimated_bytes / (1024 ** 2),
         'bonded_with_estimated': False,
     }
 
@@ -1353,6 +1361,9 @@ def _get_topology_query_mae(
     request_string: str,
     keywords_available: set,
     requests_available: set,
+    *,
+    _bonded_with_depth: int = 0,
+    _neighbor_cache: dict | None = None,
     ):
 
     '''
@@ -1371,12 +1382,27 @@ def _get_topology_query_mae(
     request_string : str
     keywords_available : set
     requests_available : set
+    _bonded_with_depth : int, default 0
+        Internal recursion counter for nested ``bonded_with`` neighbour
+        sub-queries. Capped at ``qh.MAX_BONDED_WITH_DEPTH``; deeper queries
+        raise ``RecursionError``.
+    _neighbor_cache : dict | None, default None
+        Internal call-spanning cache for resolved neighbour sets. The
+        top-level call (``_bonded_with_depth == 0``) allocates a fresh dict;
+        recursive calls reuse the parent's cache so identical neighbour
+        sub-queries at any depth are resolved exactly once per user call.
 
     Returns
     -------
     list
         Depends on request_string.
     '''
+
+    # Allocate a fresh neighbour cache at the top-level entry point so that
+    # all recursion from this user call shares one cache. Recursive calls
+    # must pass the same cache through; never reuse across user calls.
+    if _neighbor_cache is None:
+        _neighbor_cache = {}
 
     # Strip bonded_with keys before passing to the atom predicate so they
     # are not treated as atom-field constraints.
@@ -1396,18 +1422,52 @@ def _get_topology_query_mae(
     )
 
     def _matched():
+
+        '''
+        Yield atoms passing BOTH the per-atom + ffio predicates AND the
+        bond filter (when bonded_with is in the query).
+
+        When no bonded_with is present, this streams atoms with no
+        materialisation cost. When bonded_with is present, it materialises
+        predicate-passing candidates once, resolves the bond filter against
+        them, and re-yields survivors in original file order.
+
+        Every per-atom request branch consumes from this helper, so
+        bonded_with is uniformly enforced across all topology requests
+        rather than only for the global_ids branch.
+        '''
         it = (
             _iter_over_m_atoms_with_force_field_sites(mae_filepath)
             if need_sites else
             _iter_over_m_atoms(mae_filepath)
         )
-        for atom in it:
-            if _does_m_atom_query_match(atom, predicate_state) and _does_force_field_query_match(atom, ffio_ps):
+
+        bond_inc, bond_exc = qh._normalise_bonded_with_pair(query_dictionary.get('bonded_with'))
+        has_bond_filter = bool(bond_inc or bond_exc)
+
+        if not has_bond_filter:
+            for atom in it:
+                if _does_m_atom_query_match(atom, predicate_state) and _does_force_field_query_match(atom, ffio_ps):
+                    yield atom
+            return
+
+        # Bond-filter path: materialise candidates so we can apply the
+        # bond constraint, then re-yield survivors in file order.
+        base_atoms = [
+            atom for atom in it
+            if _does_m_atom_query_match(atom, predicate_state)
+            and _does_force_field_query_match(atom, ffio_ps)
+        ]
+        base_ids = [atom['global_id'] for atom in base_atoms]
+        surviving = set(_resolve_global_ids_with_bonds(base_ids))
+
+        for atom in base_atoms:
+            if atom['global_id'] in surviving:
                 yield atom
 
 
     def _resolve_global_ids_with_bonds(base_ids: list[int]) -> list[int]:
-        bond_inc, bond_exc = query_dictionary.get('bonded_with', ([], []))
+        bond_inc, bond_exc = qh._normalise_bonded_with_pair(query_dictionary.get('bonded_with'))
         bond_mode, _ = query_dictionary.get('bonded_with_mode', ('all', None))
         if not bond_inc and not bond_exc:
             return base_ids
@@ -1420,13 +1480,14 @@ def _get_topology_query_mae(
             query_dictionary=query_dictionary,
             keywords_available=keywords_available,
             requests_available=requests_available,
+            _bonded_with_depth=_bonded_with_depth,
+            _neighbor_cache=_neighbor_cache,
         )
 
     match request_string:
 
         case 'global_ids':
-            base_ids = [a['global_id'] for a in _matched()]
-            return _resolve_global_ids_with_bonds(base_ids)
+            return [a['global_id'] for a in _matched()]
 
         case 'local_ids':
             return [a['local_id'] for a in _matched()]
@@ -1732,6 +1793,9 @@ def _filter_mae_by_bonded_with(
     query_dictionary: dict,
     keywords_available: set,
     requests_available: set,
+    *,
+    _bonded_with_depth: int = 0,
+    _neighbor_cache: dict | None = None,
     ) -> list[int]:
 
     '''
@@ -1751,12 +1815,21 @@ def _filter_mae_by_bonded_with(
     query_dictionary : dict
     keywords_available : set
     requests_available : set
+    _bonded_with_depth : int, default 0
+        Internal recursion counter, plumbed through from the caller.
+    _neighbor_cache : dict | None, default None
+        Internal call-spanning neighbour cache, plumbed through from the
+        caller. None means "fresh allocation" (only happens at top-level
+        entry points).
 
     Returns
     -------
     list[int]
         Filtered candidate global IDs.
     '''
+
+    if _neighbor_cache is None:
+        _neighbor_cache = {}
 
     if mode not in ('all', 'any'):
         raise ValueError("bonded_with_mode must be 'all' or 'any'.")
@@ -1795,17 +1868,40 @@ def _filter_mae_by_bonded_with(
     def _resolve_neighbor_set(block: dict) -> set[int] | None:
         if block.get('total', False):
             return None
-        neighbor_q = dict(block.get('neighbor', {}))
-        neighbor_q.pop('bonded_with', None)
+        neighbor_q = block.get('neighbor')
+        if not isinstance(neighbor_q, dict):
+            raise ValueError(
+                "bonded_with block must include 'neighbor' dict unless total=True."
+            )
+        # Recursion depth check — increment for the recursive call below.
+        next_depth = _bonded_with_depth + 1
+        if next_depth > qh.MAX_BONDED_WITH_DEPTH:
+            raise RecursionError(
+                f"bonded_with neighbour recursion exceeded max depth of "
+                f"{qh.MAX_BONDED_WITH_DEPTH}. Most realistic chemistry "
+                f"queries require depth <= 5; check your query for "
+                f"unintended deep nesting."
+            )
+        neighbor_q = dict(neighbor_q)
+        # Strip bonded_with_mode (parent-level orchestration concern).
+        # bonded_with itself is intentionally KEPT — neighbour sub-queries
+        # may carry their own bonded_with for graph-pattern matching.
         neighbor_q.pop('bonded_with_mode', None)
+        key = qh._freeze_query(neighbor_q)
+        if key in _neighbor_cache:
+            return _neighbor_cache[key]
         ids = _get_topology_query_mae(
             mae_filepath=mae_filepath,
             query_dictionary=neighbor_q,
             request_string='global_ids',
             keywords_available=keywords_available,
             requests_available=requests_available,
+            _bonded_with_depth=next_depth,
+            _neighbor_cache=_neighbor_cache,
         )
-        return set(ids)
+        s = set(ids)
+        _neighbor_cache[key] = s
+        return s
 
     # Resolve neighbor sets
     set_id_to_col: dict[int, int] = {}
@@ -1950,7 +2046,7 @@ def _iter_over_m_bonds(mae_filepath: str | Path):
 
 
 # size of the plan 
-def _get_mae_topo_request_plan_shape(request_string: str) -> tuple[str, tuple, int | None]:
+def _get_topology_plan_shape_mae(request_string: str) -> tuple[str, tuple, int | None]:
 
     '''
     Return (output_kind, trailing_shape, bytes_per_match) for the topology planner.
@@ -1969,7 +2065,7 @@ def _get_mae_topo_request_plan_shape(request_string: str) -> tuple[str, tuple, i
 
     # All typing requests are valid for topology too — delegate first
     try:
-        return _get_mae_type_request_plan_shape(request_string)
+        return _get_type_plan_shape_mae(request_string)
     except ValueError:
         pass
 

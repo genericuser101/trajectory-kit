@@ -5,8 +5,8 @@ import importlib
 
 # Third Party Imports: (numpy)
 import numpy as np
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 class sim():
 
@@ -70,10 +70,11 @@ class sim():
                 "type_attr": "type_type",
                 "keys_attr": "type_file_keys",
                 "reqs_attr": "type_file_reqs",
-                "keys_fn_template": "_get_type_keys_reqs_{fmt}",
-                "plan_fn_template": "_plan_type_query_{fmt}",
-                "query_fn_template": "_get_type_query_{fmt}",
-                "update_fn_template": "_update_type_globals_{fmt}",
+                "keys_fn_template":       "_get_type_keys_reqs_{fmt}",
+                "plan_fn_template":       "_plan_type_query_{fmt}",
+                "plan_shape_fn_template": "_get_type_plan_shape_{fmt}",
+                "query_fn_template":      "_get_type_query_{fmt}",
+                "update_fn_template":     "_update_type_globals_{fmt}",
                 "label": "typing",
             },
 
@@ -83,23 +84,25 @@ class sim():
                 "type_attr": "top_type",
                 "keys_attr": "topo_file_keys",
                 "reqs_attr": "topo_file_reqs",
-                "keys_fn_template": "_get_topology_keys_reqs_{fmt}",
-                "plan_fn_template": "_plan_topology_query_{fmt}",
-                "query_fn_template": "_get_topology_query_{fmt}",
-                "update_fn_template": "_update_topology_globals_{fmt}",
+                "keys_fn_template":       "_get_topology_keys_reqs_{fmt}",
+                "plan_fn_template":       "_plan_topology_query_{fmt}",
+                "plan_shape_fn_template": "_get_topology_plan_shape_{fmt}",
+                "query_fn_template":      "_get_topology_query_{fmt}",
+                "update_fn_template":     "_update_topology_globals_{fmt}",
                 "label": "topology",
             },
 
             "trajectory": {
-                "supported_formats": {".dcd"},
+                "supported_formats": {".dcd", ".coor"},
                 "file_attr": "traj_file",
                 "type_attr": "traj_type",
                 "keys_attr": "traj_file_keys",
                 "reqs_attr": "traj_file_reqs",
-                "keys_fn_template":  "_get_trajectory_keys_reqs_{fmt}",
-                "plan_fn_template":  "_plan_trajectory_query_{fmt}",
-                "query_fn_template": "_get_trajectory_query_{fmt}",
-                "update_fn_template":"_update_trajectory_globals_{fmt}",
+                "keys_fn_template":       "_get_trajectory_keys_reqs_{fmt}",
+                "plan_fn_template":       "_plan_trajectory_query_{fmt}",
+                "plan_shape_fn_template": "_get_trajectory_plan_shape_{fmt}",
+                "query_fn_template":      "_get_trajectory_query_{fmt}",
+                "update_fn_template":     "_update_trajectory_globals_{fmt}",
                 "label": "trajectory",
             },
             
@@ -127,6 +130,8 @@ class sim():
 
         if trajectory is not None:
             self.load_trajectory(trajectory)
+
+        
 
 
     # -------------------------------------------------------------------------
@@ -348,7 +353,6 @@ class sim():
                     top_reqs[i]   if i < len(top_reqs)   else "",
                     traj_reqs[i]  if i < len(traj_reqs)  else "")
 
-        #print(sep)
         print()
 
 
@@ -375,12 +379,12 @@ class sim():
     # USER INTERFACE FUNCTIONS 
     # -------------------------------------------------------------------------
 
-
     def positions(self,
                   TYPE_Q: dict = None,
                   TOPO_Q: dict = None,
                   TRAJ_Q: dict = None,
                   *,
+                  devFlag: bool = False,
                   updateFlag: bool = False,
                   planFlag: bool = False   ) -> dict:
         
@@ -388,7 +392,7 @@ class sim():
         Return positions for atoms selected by typing and/or topology queries.
 
         When a trajectory file is loaded, positions are read from it (all
-        selected frames).  When no trajectory file is loaded, positions are
+        selected frames). When no trajectory file is loaded, positions are
         read directly from the static typing or topology file, and the payload
         has shape ``(1, n_atoms, 3)`` to keep the API uniform.
 
@@ -405,9 +409,6 @@ class sim():
         - TYPE_Q + TOPO_Q  -> intersection of both selections
         - neither provided -> all atoms in the source file
 
-        The typing and topology layers are always treated as global_id selectors
-        in this function.
-
         Parameters:
         ----------
         TYPE_Q, TOPO_Q, TRAJ_Q : dict, optional
@@ -418,16 +419,20 @@ class sim():
             Passed through to the underlying domain handlers.
 
         planFlag : bool, default=False
-            If True, return the execution plan without executing the query.
+            If True, return the envelope without the payload (plan only).
 
         Returns:
         -------
         dict
-            Structured output containing:
-                - mode          "positions"
-                - selection     atom summary
-                - plan          execution plan
-                - payload       positions array and metadata
+            Standardised five-key envelope:
+                mode      = "positions"
+                selection = per-domain selection block (intersection mode)
+                metadata  = per-domain file metadata for every loaded file
+                plan      = single-domain plan for whichever domain produced
+                            the coordinates (trajectory if loaded, else the
+                            chosen static fallback)
+                payload   = ndarray of shape (n_frames, n_atoms_selected, 3),
+                            or None when planFlag=True
         '''
 
         TYPE_Q = self._normalise_query(TYPE_Q)
@@ -436,10 +441,11 @@ class sim():
 
         type_provided = bool(TYPE_Q)
         topo_provided = bool(TOPO_Q)
+        traj_provided = bool(TRAJ_Q)
         static_domain = None
 
         # ------------------------------------------------------------------ #
-        # Build plan — validation, zero file I/O, stochastic planner only.   #
+        # Decide which domain produces the coordinates and build the plan.   #
         # ------------------------------------------------------------------ #
 
         if self.traj_file is not None:
@@ -449,11 +455,8 @@ class sim():
                         "positions() requires at least one of: a typing file, a topology "
                         "file, or explicit TYPE_Q / TOPO_Q to define the atom selection."
                     )
-            plan = self._plan_domain_request(
-                domain="trajectory",
-                query_dictionary=TRAJ_Q,
-                request_string="positions",
-            )
+            source_domain = "trajectory"
+            plan_query    = TRAJ_Q
         else:
             if self.type_file is not None and "positions" in self.type_file_reqs:
                 static_domain = "typing"
@@ -465,41 +468,74 @@ class sim():
                     "supports 'positions'. Load a trajectory file or a file type that "
                     "carries coordinates (e.g. PDB or XYZ as the typing file)."
                 )
-            plan = self._plan_domain_request(
-                domain=static_domain,
-                query_dictionary=TYPE_Q if static_domain == "typing" else TOPO_Q,
+            source_domain = static_domain
+            plan_query    = TYPE_Q if static_domain == "typing" else TOPO_Q
+
+        if devFlag: # dev hotpath
+
+            plan_result = self._plan_domain_request(
+                domain=source_domain,
+                query_dictionary=plan_query,
                 request_string="positions",
             )
+            plan = {source_domain: plan_result} if plan_result is not None else {}
 
-        out = {
-            "mode": "positions",
-            "selection": {
-                "count":      None,
-                "sources":    [],
-                "merge_mode": "intersection",
-            },
-            "plan":    plan,
-            "payload": None,
-        }
+            # Inject the cross-domain combined estimate. For positions() this
+            # rolls up a single domain so combined mirrors that one entry.
+            combined = self._build_combined_plan_estimate(plan)
+            if combined is not None:
+                plan["combined"] = combined
 
-        if planFlag:
-            return out
+            metadata = self._build_metadata_for_loaded_domains()
+
+            # planFlag short-circuit — return envelope without the payload.
+            # Selection block carries provided-flags but no resolved counts yet.
+            if planFlag:
+                selection = self._build_selection_block(
+                    merge_mode="intersection",
+                    type_q_provided=type_provided,
+                    topo_q_provided=topo_provided,
+                    traj_q_provided=traj_provided,
+                    type_ids=None, topo_ids=None, traj_ids=None,
+                    resolved_count=None,
+                )
+                return self._build_envelope(
+                    mode="positions", selection=selection,
+                    metadata=metadata, plan=plan, payload=None,
+                )
 
         # ------------------------------------------------------------------ #
-        # Resolve atom selection                                              #
+        # Resolve atom selection from typing / topology queries.             #
         # ------------------------------------------------------------------ #
 
-        if type_provided or topo_provided:
-            selected_globals = self._resolve_atom_selection(
-                TYPE_Q=TYPE_Q if type_provided else None,
-                TOPO_Q=TOPO_Q if topo_provided else None,
-                updateFlag=updateFlag,
+        type_ids = None
+        topo_ids = None
+        traj_ids = None  # positions() never collects a trajectory id constraint
+
+        if type_provided:
+            type_ids = self.get_types(
+                QUERY=TYPE_Q, REQUEST="global_ids", updateFlag=updateFlag,
             )
+        if topo_provided:
+            topo_ids = self.get_topology(
+                QUERY=TOPO_Q, REQUEST="global_ids", updateFlag=updateFlag,
+            )
+
+        if type_ids is not None and topo_ids is not None:
+            selected_globals = sorted(set(type_ids) & set(topo_ids))
+            if not selected_globals:
+                raise ValueError(
+                    "Typing and topology selections produced an empty intersection."
+                )
+        elif type_ids is not None:
+            selected_globals = sorted(type_ids)
+        elif topo_ids is not None:
+            selected_globals = sorted(topo_ids)
         else:
             selected_globals = None
 
         # ------------------------------------------------------------------ #
-        # Trajectory path                                                      #
+        # Trajectory path                                                     #
         # ------------------------------------------------------------------ #
 
         if self.traj_file is not None:
@@ -517,17 +553,31 @@ class sim():
             traj_query = dict(TRAJ_Q)
             traj_query["global_ids"] = (selected_globals, set())
 
-            out["selection"]["count"] = len(selected_globals)
-            out["selection"]["sources"] = [
-                name for name, q in (("typing", TYPE_Q), ("topology", TOPO_Q)) if q
-            ]
-
-            out["payload"] = self.get_trajectory(
+            pos = self.get_trajectory(
                 QUERY=traj_query,
                 REQUEST="positions",
                 updateFlag=updateFlag,
             )
-            return out
+
+            if devFlag: # dev hotpath
+
+                selection = self._build_selection_block(
+                    merge_mode="intersection",
+                    type_q_provided=type_provided,
+                    topo_q_provided=topo_provided,
+                    traj_q_provided=traj_provided,
+                    type_ids=type_ids, topo_ids=topo_ids, traj_ids=traj_ids,
+                    resolved_count=len(selected_globals),
+                )
+
+                return self._build_envelope(
+                    mode="positions", selection=selection,
+                    metadata=metadata, plan=plan, payload=pos,
+                )
+            
+            else:
+
+                return pos
 
         # ------------------------------------------------------------------ #
         # Static path                                                        #
@@ -539,19 +589,14 @@ class sim():
         static_query = dict(TYPE_Q if static_domain == "typing" else TOPO_Q)
 
         if selected_globals is None:
-            if static_domain == "typing":
-                selected_globals = self.get_types(
-                    QUERY=static_query, REQUEST="global_ids", updateFlag=updateFlag,
-                )
-            else:
-                selected_globals = self.get_topology(
-                    QUERY=static_query, REQUEST="global_ids", updateFlag=updateFlag,
-                )
-
-        out["selection"]["count"] = len(selected_globals)
-        out["selection"]["sources"] = [
-            name for name, q in (("typing", TYPE_Q), ("topology", TOPO_Q)) if q
-        ]
+            selected_globals = (
+                type_ids if static_domain == "typing" and type_ids is not None
+                else (topo_ids if static_domain == "topology" and topo_ids is not None
+                      else self._execute_domain_request(
+                          domain=static_domain, query_dictionary=static_query,
+                          request_string="global_ids", updateFlag=updateFlag,
+                      ))
+            )
 
         pos = self._execute_domain_request(
             domain=static_domain,
@@ -560,7 +605,10 @@ class sim():
             updateFlag=updateFlag,
         )
 
-        if pos is not None:
+        if pos is not None and pos.shape[1] != len(selected_globals):
+            # Static-file positions came back with all-matches for the static
+            # query; we still need to reduce to the resolved selection if it
+            # is narrower (e.g. typing AND topology both provided).
             all_ids = self._execute_domain_request(
                 domain=static_domain,
                 query_dictionary=static_query,
@@ -571,8 +619,25 @@ class sim():
             mask    = [i for i, g in enumerate(all_ids) if g in gid_set]
             pos     = pos[:, mask, :]
 
-        out["payload"] = pos
-        return out
+        if devFlag: # dev hotpath
+
+            selection = self._build_selection_block(
+                merge_mode="intersection",
+                type_q_provided=type_provided,
+                topo_q_provided=topo_provided,
+                traj_q_provided=traj_provided,
+                type_ids=type_ids, topo_ids=topo_ids, traj_ids=traj_ids,
+                resolved_count=len(selected_globals),
+            )
+
+            return self._build_envelope(
+                mode="positions", selection=selection,
+                metadata=metadata, plan=plan, payload=pos,
+            )
+        
+        else: 
+
+            return pos
     
     
     def select(self,
@@ -583,19 +648,23 @@ class sim():
                 TYPE_R: str = None,
                 TOPO_R: str = None,
                 TRAJ_R: str = None,
+                devFlag: bool = False,
                 updateFlag: bool = False,
                 planFlag: bool = False   ) -> dict:
         
         '''
         Return property values from typing, topology, and/or trajectory domains.
 
-        This function is for property-style requests only.
-        It does not return trajectory coordinate payloads.
+        This function is for property-style requests only (those starting with
+        ``property-``). It does not return per-atom payloads or coordinate
+        arrays — use ``fetch()`` or ``positions()`` for those.
 
         Parameters:
         ----------
         TYPE_Q, TOPO_Q, TRAJ_Q : dict, optional
             Query dictionaries for typing, topology, and trajectory respectively.
+            (Currently unused for property requests, but accepted to preserve
+            envelope symmetry across positions/fetch/select.)
 
         TYPE_R, TOPO_R, TRAJ_R : str, optional
             Property request strings for typing, topology, and trajectory.
@@ -603,10 +672,15 @@ class sim():
         updateFlag : bool, default=False
             Passed through to the underlying domain handlers.
 
+        planFlag : bool, default=False
+            If True, return the envelope without the payload.
+
         Returns:
         -------
         dict
-            Structured output containing returned property payloads by domain.
+            Standardised five-key envelope. ``selection.merge_mode`` is
+            ``"none"`` for select() — property requests do not perform
+            cross-domain atom-set intersection.
         '''
         
         TYPE_Q = self._normalise_query(TYPE_Q)
@@ -638,62 +712,70 @@ class sim():
                 "Use positions() for trajectory coordinates."
             )
 
-        plan = {}
-        payload = {}
+        if devFlag: # dev hotpath
 
-        if TYPE_R is not None:
-            plan["typing"] = self._plan_domain_request(
-                domain="typing",
-                query_dictionary=TYPE_Q,
-                request_string=TYPE_R,
+            # Build per-domain plans for every requested domain.
+            plan: dict = {}
+            for label, q, r in (("typing", TYPE_Q, TYPE_R),
+                                ("topology", TOPO_Q, TOPO_R),
+                                ("trajectory", TRAJ_Q, TRAJ_R)):
+                if r is not None:
+                    result = self._plan_domain_request(
+                        domain=label, query_dictionary=q, request_string=r,
+                    )
+                    if result is not None:
+                        plan[label] = result
+
+            # select() typically only handles property-* requests, which
+            # short-circuit to None in _plan_domain_request — so plan is
+            # usually empty here and combined will be omitted.
+            combined = self._build_combined_plan_estimate(plan)
+            if combined is not None:
+                plan["combined"] = combined
+
+            metadata = self._build_metadata_for_loaded_domains()
+
+            # select() never intersects — selection block carries query_provided
+            # flags only, with merge_mode="none" and ids_provided always False.
+            selection = self._build_selection_block(
+                merge_mode="none",
+                type_q_provided=bool(TYPE_Q),
+                topo_q_provided=bool(TOPO_Q),
+                traj_q_provided=bool(TRAJ_Q),
+                type_ids=None, topo_ids=None, traj_ids=None,
+                resolved_count=None,
             )
 
-        if TOPO_R is not None:
-            plan["topology"] = self._plan_domain_request(
-                domain="topology",
-                query_dictionary=TOPO_Q,
-                request_string=TOPO_R,
-            )
+            if planFlag:
+                return self._build_envelope(
+                    mode="select", selection=selection,
+                    metadata=metadata, plan=plan, payload=None,
+                )
 
-        if TRAJ_R is not None:
-            plan["trajectory"] = self._plan_domain_request(
-                domain="trajectory",
-                query_dictionary=TRAJ_Q,
-                request_string=TRAJ_R,
-            )
-
-        out = {
-            "mode": "property",
-            "plan": plan,
-            "payload": None,
-        }
-
-        if planFlag:
-            return out
-
+        payload: dict = {}
         if TYPE_R is not None:
             payload["typing"] = self.get_types(
-                QUERY=TYPE_Q,
-                REQUEST=TYPE_R,
-                updateFlag=updateFlag,
+                QUERY=TYPE_Q, REQUEST=TYPE_R, updateFlag=updateFlag,
             )
-
         if TOPO_R is not None:
             payload["topology"] = self.get_topology(
-                QUERY=TOPO_Q,
-                REQUEST=TOPO_R,
-                updateFlag=updateFlag,
+                QUERY=TOPO_Q, REQUEST=TOPO_R, updateFlag=updateFlag,
             )
-
         if TRAJ_R is not None:
             payload["trajectory"] = self.get_trajectory(
-                QUERY=TRAJ_Q,
-                REQUEST=TRAJ_R,
-                updateFlag=updateFlag,
+                QUERY=TRAJ_Q, REQUEST=TRAJ_R, updateFlag=updateFlag,
             )
 
-        out["payload"] = payload
-        return out
+        if devFlag: # dev hotpath
+
+            return self._build_envelope(
+                mode="select", selection=selection,
+                metadata=metadata, plan=plan, payload=payload,
+            )
+        
+        else: 
+
+            return payload
     
 
     def fetch(self,
@@ -704,6 +786,7 @@ class sim():
               TYPE_R: str = None,
               TOPO_R: str = None,
               TRAJ_R: str = None,
+              devFlag: bool = False,
               updateFlag: bool = False,
               planFlag: bool = False) -> dict:
 
@@ -711,7 +794,7 @@ class sim():
         Return per-atom or coordinate payloads from any combination of
         typing, topology, and trajectory domains.
 
-        This is the general-purpose extraction function. positions() is a
+        This is the general-purpose extraction function. ``positions()`` is a
         convenience wrapper around the trajectory positions case.
 
             fetch()     — any non-property request across all three domains
@@ -732,61 +815,28 @@ class sim():
         that encode per-atom properties (e.g. per-frame charges) can return
         per-frame id lists to participate in the intersection.
 
-        Examples:
-
-            TYPE_Q + TOPO_R="charges"
-                → resolve typing global_ids, return charges for those atoms
-
-            TYPE_Q + TOPO_Q + TOPO_R="charges" + TYPE_R="atom_names"
-                → intersect typing and topology selections, apply to both
-
-            TYPE_Q + TOPO_Q + TRAJ_R="positions" + TRAJ_Q={"frame_interval": ...}
-                → intersect typing and topology, pass as global_ids to trajectory
-
-        Parameters:
-        ----------
-        TYPE_Q, TOPO_Q, TRAJ_Q : dict, optional
-            Query dictionaries for typing, topology, and trajectory respectively.
-
-        TYPE_R, TOPO_R, TRAJ_R : str, optional
-            Request strings for typing, topology, and trajectory respectively.
-            Any non-property request is accepted, e.g. "charges", "masses",
-            "atom_names", "positions".
-
-        updateFlag : bool, default=False
-            Passed through to the underlying domain handlers.
-
-        planFlag : bool, default=False
-            If True, return the execution plan without executing the query.
-
         Returns:
         -------
         dict
-            {
-                "mode":      "fetch",
-                "selection": {
-                    "count":      int   | None,
-                    "sources":    [...],
-                    "merge_mode": "intersection",
-                },
-                "plan":    { domain: plan, ... },
-                "payload": { domain: payload, ... },
-            }
-
-        Raises:
-        ------
-        ValueError
-            If no request string is provided, if a request is a property-*
-            request (use select()), or if the cross-domain intersection is empty.
+            Standardised five-key envelope:
+                mode      = "fetch"
+                selection = per-domain selection block (intersection mode)
+                metadata  = per-domain file metadata for every loaded file
+                plan      = per-domain plan for every queried domain, plus
+                            a "combined" sub-dict with the cross-domain
+                            n_atoms_upper_bound and total_estimated_bytes
+                payload   = {domain: <bare value | ndarray>, ...} — array
+                            payload requests (positions/velocities) yield
+                            ndarrays of shape (n_frames, n_atoms_selected, 3)
         '''
 
         TYPE_Q = self._normalise_query(TYPE_Q)
         TOPO_Q = self._normalise_query(TOPO_Q)
         TRAJ_Q = self._normalise_query(TRAJ_Q)
 
-        type_provided = bool(TYPE_Q)
-        topo_provided = bool(TOPO_Q)
-        traj_provided = bool(TRAJ_Q)
+        type_q_provided = bool(TYPE_Q)
+        topo_q_provided = bool(TOPO_Q)
+        traj_q_provided = bool(TRAJ_Q)
 
         TYPE_R = self._normalise_request(TYPE_R)
         TOPO_R = self._normalise_request(TOPO_R)
@@ -795,114 +845,100 @@ class sim():
         if TYPE_R is None and TOPO_R is None and TRAJ_R is None:
             raise ValueError("fetch() requires at least one request string (TYPE_R, TOPO_R, or TRAJ_R).")
 
-        if TYPE_R is not None and self._classify_request("typing", TYPE_R) == "property":
-            raise ValueError(
-                f"TYPE_R='{TYPE_R}' is a property request. "
-                "Use select() for property-* requests."
-            )
+        for label, r in (("TYPE_R", TYPE_R), ("TOPO_R", TOPO_R), ("TRAJ_R", TRAJ_R)):
+            if r is not None:
+                domain = {"TYPE_R": "typing", "TOPO_R": "topology", "TRAJ_R": "trajectory"}[label]
+                if self._classify_request(domain, r) == "property":
+                    raise ValueError(
+                        f"{label}='{r}' is a property request. "
+                        f"Use select() for property-* requests."
+                    )
 
-        if TOPO_R is not None and self._classify_request("topology", TOPO_R) == "property":
-            raise ValueError(
-                f"TOPO_R='{TOPO_R}' is a property request. "
-                "Use select() for property-* requests."
-            )
+        if devFlag: # dev hotpath
 
-        if TRAJ_R is not None and self._classify_request("trajectory", TRAJ_R) == "property":
-            raise ValueError(
-                f"TRAJ_R='{TRAJ_R}' is a property request. "
-                "Use select() for property-* requests."
-            )
+            # ------------------------------------------------------------------ #
+            # Build plans + metadata up-front (zero file I/O for plans beyond    #
+            # what the parser planner does).                                      #
+            # ------------------------------------------------------------------ #
 
-        # ------------------------------------------------------------------ #
-        # Build plans — zero file I/O, stochastic planner only.              #
-        # ------------------------------------------------------------------ #
+            plan: dict = {}
+            for label, q, r in (("typing", TYPE_Q, TYPE_R),
+                                ("topology", TOPO_Q, TOPO_R),
+                                ("trajectory", TRAJ_Q, TRAJ_R)):
+                if r is not None:
+                    result = self._plan_domain_request(
+                        domain=label, query_dictionary=q, request_string=r,
+                    )
+                    if result is not None:
+                        plan[label] = result
 
-        plan = {}
+            # Inject the cross-domain combined estimate. n_atoms_upper_bound
+            # = min across per-domain plans (the true intersection cannot
+            # exceed any contributor); total_estimated_bytes uses that bound
+            # times each domain's n_frames * bytes_per_atom_per_frame.
+            combined = self._build_combined_plan_estimate(plan)
+            if combined is not None:
+                plan["combined"] = combined
 
-        if TYPE_R is not None:
-            plan["typing"] = self._plan_domain_request(
-                domain="typing",
-                query_dictionary=TYPE_Q,
-                request_string=TYPE_R,
-            )
+            metadata = self._build_metadata_for_loaded_domains()
 
-        if TOPO_R is not None:
-            plan["topology"] = self._plan_domain_request(
-                domain="topology",
-                query_dictionary=TOPO_Q,
-                request_string=TOPO_R,
-            )
-
-        if TRAJ_R is not None:
-            plan["trajectory"] = self._plan_domain_request(
-                domain="trajectory",
-                query_dictionary=TRAJ_Q,
-                request_string=TRAJ_R,
-            )
-
-        out = {
-            "mode": "fetch",
-            "selection": {
-                "count":      None,
-                "sources":    [],
-                "merge_mode": "intersection",
-            },
-            "plan":    plan,
-            "payload": None,
-        }
-
-        if planFlag:
-            return out
+            if planFlag:
+                selection = self._build_selection_block(
+                    merge_mode="intersection",
+                    type_q_provided=type_q_provided,
+                    topo_q_provided=topo_q_provided,
+                    traj_q_provided=traj_q_provided,
+                    type_ids=None, topo_ids=None, traj_ids=None,
+                    resolved_count=None,
+                )
+                return self._build_envelope(
+                    mode="fetch", selection=selection,
+                    metadata=metadata, plan=plan, payload=None,
+                )
 
         # ------------------------------------------------------------------ #
-        # Resolve global_ids for intersection.                                #
-        # Only domains with a query constraint contribute an id set.          #
+        # Resolve global_ids for intersection. Only domains with a query     #
+        # constraint contribute an id set.                                    #
         # ------------------------------------------------------------------ #
 
-        type_global_ids = None
-        topo_global_ids = None
-        traj_global_ids = None
+        type_ids = None
+        topo_ids = None
+        traj_ids = None
 
-        if type_provided:
+        if type_q_provided:
             self._ensure_domain_loaded("typing")
-            type_global_ids = self.get_types(
+            type_ids = self.get_types(
                 QUERY=TYPE_Q, REQUEST="global_ids", updateFlag=updateFlag,
             )
 
-        if topo_provided:
+        if topo_q_provided:
             self._ensure_domain_loaded("topology")
-            topo_global_ids = self.get_topology(
+            topo_ids = self.get_topology(
                 QUERY=TOPO_Q, REQUEST="global_ids", updateFlag=updateFlag,
             )
 
-        if traj_provided:
+        if traj_q_provided:
             self._ensure_domain_loaded("trajectory")
             traj_selection = self.get_trajectory(
                 QUERY=TRAJ_Q, REQUEST="global_ids", updateFlag=updateFlag,
             )
+            # Hotpath: trajectory returns None or [None, None, ...] -> no constraint.
+            # When the trajectory format actually carries per-atom data and
+            # contributes ids, traj_selection is a list of per-frame id lists.
             if traj_selection is None:
-                pass   # DCD hotpath — no constraint from trajectory
+                pass
             elif isinstance(traj_selection, list):
                 if not all(f is None for f in traj_selection):
                     traj_ids_set: set[int] = set()
                     for frame_ids in traj_selection:
                         if frame_ids is not None:
                             traj_ids_set.update(frame_ids)
-                    traj_global_ids = sorted(traj_ids_set)
+                    traj_ids = sorted(traj_ids_set)
 
-        # THIS IS IMPORTANT: we hotpath by allowing None to propagate as "no constraint" from any domain, 
-        # which means the intersection logic only applies to domains that actually return id sets. 
-        # For example, a trajectory query that returns [None, None, ...] (no per-frame constraints) 
-        # will not interfere with the intersection of typing and topology selections.
-
-        # None is however not the same as an empty set — an empty set means "constrained to zero atoms" 
-        # and will produce an empty intersection result, whereas None means "no constraint from this domain" 
-        # and is effectively ignored in the intersection logic.
-
-        active = [  # Intersect all non-None id sets
-            set(ids) for ids in (type_global_ids, topo_global_ids, traj_global_ids)
-            if ids is not None
-        ]
+        # None means "no constraint from this domain" — distinct from empty
+        # set, which means "constrained to zero atoms". Only sets that are
+        # not None participate in the intersection.
+        active = [set(ids) for ids in (type_ids, topo_ids, traj_ids) if ids is not None]
 
         if len(active) > 1:
             selected_globals = sorted(set.intersection(*active))
@@ -922,59 +958,77 @@ class sim():
         cross_domain = selected_globals is not None and len(active) > 1
 
         if cross_domain:
-            if TYPE_R is not None and type_global_ids is None:
-                type_global_ids = self.get_types(
+            if TYPE_R is not None and type_ids is None:
+                type_ids = self.get_types(
                     QUERY=TYPE_Q, REQUEST="global_ids", updateFlag=updateFlag,
                 )
-            if TOPO_R is not None and topo_global_ids is None:
-                topo_global_ids = self.get_topology(
+            if TOPO_R is not None and topo_ids is None:
+                topo_ids = self.get_topology(
                     QUERY=TOPO_Q, REQUEST="global_ids", updateFlag=updateFlag,
                 )
 
-        out["selection"]["count"] = len(selected_globals) if selected_globals is not None else None
-        out["selection"]["sources"] = [
-            name for name, ids in (
-                ("typing",     type_global_ids),
-                ("topology",   topo_global_ids),
-                ("trajectory", traj_global_ids),
-            ) if ids is not None
-        ]
-
         # ------------------------------------------------------------------ #
-        # Execute and post-filter                                             #
+        # Execute and post-filter. Per-atom array payloads (positions,       #
+        # velocities) come back as bare ndarrays; everything else as lists   #
+        # or scalars. Cross-domain intersection mask is applied uniformly.   #
         # ------------------------------------------------------------------ #
 
         all_globals = list(range(self.global_system_properties['num_atoms']))
-
-        payload = {}
         gid_set = set(selected_globals) if selected_globals is not None else None
+        payload: dict = {}
 
         if TYPE_R is not None:
             raw = self.get_types(QUERY=TYPE_Q, REQUEST=TYPE_R, updateFlag=updateFlag)
-            if gid_set is not None and isinstance(raw, list):
-                ids = type_global_ids if type_global_ids is not None else all_globals
-                raw = [v for v, g in zip(raw, ids) if g in gid_set]
-            payload["typing"] = raw
+            if isinstance(raw, np.ndarray):
+                if gid_set is not None and type_ids is not None:
+                    mask = [i for i, g in enumerate(type_ids) if g in gid_set]
+                    raw  = raw[:, mask, :]
+                payload["typing"] = raw
+            else:
+                if gid_set is not None and isinstance(raw, list):
+                    ids = type_ids if type_ids is not None else all_globals
+                    raw = [v for v, g in zip(raw, ids) if g in gid_set]
+                payload["typing"] = raw
 
         if TOPO_R is not None:
             raw = self.get_topology(QUERY=TOPO_Q, REQUEST=TOPO_R, updateFlag=updateFlag)
-            if gid_set is not None and isinstance(raw, list):
-                ids = topo_global_ids if topo_global_ids is not None else all_globals
-                raw = [v for v, g in zip(raw, ids) if g in gid_set]
-            payload["topology"] = raw
+            if isinstance(raw, np.ndarray):
+                if gid_set is not None and topo_ids is not None:
+                    mask = [i for i, g in enumerate(topo_ids) if g in gid_set]
+                    raw  = raw[:, mask, :]
+                payload["topology"] = raw
+            else:
+                if gid_set is not None and isinstance(raw, list):
+                    ids = topo_ids if topo_ids is not None else all_globals
+                    raw = [v for v, g in zip(raw, ids) if g in gid_set]
+                payload["topology"] = raw
 
         if TRAJ_R is not None:
             traj_query = dict(TRAJ_Q)
             if selected_globals is not None:
                 traj_query["global_ids"] = (selected_globals, set())
-            payload["trajectory"] = self.get_trajectory(
-                QUERY=traj_query,
-                REQUEST=TRAJ_R,
-                updateFlag=updateFlag,
+            raw = self.get_trajectory(QUERY=traj_query, REQUEST=TRAJ_R, updateFlag=updateFlag)
+            payload["trajectory"] = raw
+
+        if devFlag: # dev hotpath
+
+            selection = self._build_selection_block(
+                merge_mode="intersection",
+                type_q_provided=type_q_provided,
+                topo_q_provided=topo_q_provided,
+                traj_q_provided=traj_q_provided,
+                type_ids=type_ids, topo_ids=topo_ids, traj_ids=traj_ids,
+                resolved_count=(len(selected_globals) if selected_globals is not None else None),
             )
 
-        out["payload"] = payload
-        return out
+            return self._build_envelope(
+                mode="fetch", selection=selection,
+                metadata=metadata, plan=plan, payload=payload,
+            )
+        
+        else: 
+
+            return payload
 
 
     # -------------------------------------------------------------------------
@@ -1090,6 +1144,488 @@ class sim():
 
 
     # -------------------------------------------------------------------------
+    # RESULT ENVELOPE STANDARDISATION
+    # -------------------------------------------------------------------------
+    
+    # Every user-facing call (positions, fetch, select) returns the same
+    # five-key envelope:
+    #
+    #   {
+    #     "mode":      "positions" | "fetch" | "select",
+    #     "selection": { ... per-domain query/ids info, identical schema ... },
+    #     "metadata":  { domain: { ... per-domain file facts ... }, ... },
+    #     "plan":      { domain: { ... per-domain query plan ... }, ... },
+    #     "payload":   <ndarray>                              # positions()
+    #                | { domain: <bare value>, ... }          # fetch() / select()
+    #   }
+    #
+    # `metadata` is query-independent — it reflects every loaded file.
+    # `plan` is query-dependent — it only includes domains touched by the call.
+    # `selection` always carries blocks for all three domains so the schema
+    # the user sees is identical across modes.
+    #
+    # Within metadata and plan, every per-domain dict has three tiers:
+    #   tier 1 — required keys, hard-fail if a parser omits them
+    #   tier 2 — optional, omitted entirely (never None) when not meaningful
+    #   tier 3 — `format_specific: {...}` for genuinely format-unique extras
+    # -------------------------------------------------------------------------
+
+    # Tier-1 metadata keys per domain.
+    _METADATA_TIER_1_BY_DOMAIN = {
+        "typing":     ("source", "file_path", "file_format", "file_size_bytes", "n_atoms"),
+        "topology":   ("source", "file_path", "file_format", "file_size_bytes", "n_atoms"),
+        "trajectory": ("source", "file_path", "file_format", "file_size_bytes", "n_atoms", "n_frames"),
+    }
+
+    # Tier-2 metadata keys the standardiser knows how to surface.
+    # Anything in raw_meta with one of these names (or its alias) is promoted
+    # to top-level when present and non-None.
+    _METADATA_TIER_2_KEYS = frozenset({
+        "n_residues", "n_segments", "box_size", "ensemble_type",
+        "simulation_type", "timestep", "sim_name", "units",
+    })
+
+    # Aliases mapping legacy/global_system_properties names -> canonical names.
+    _METADATA_KEY_ALIASES = {
+        "num_atoms":      "n_atoms",
+        "num_frames":     "n_frames",
+        "num_residues":   "n_residues",
+        "num_segments":   "n_segments",
+        "start_box_size": "box_size",
+    }
+
+    # Tier-1 plan keys.
+    #
+    # n_atoms semantics depend on planner_mode:
+    #   "header"     → file-wide atom count (exact, but does NOT reflect
+    #                  cross-domain selection; the selection.resolved_count
+    #                  is the post-intersection truth)
+    #   "stochastic" → estimated atoms matching the domain's query predicate
+    #
+    # n_frames follows the same split: header gives file total (or
+    # frame_interval-reduced total), stochastic always reports 1 for
+    # static files.
+    #
+    # bytes_per_atom_per_frame is sourced from the parser's plan_shape
+    # function (NOT raw_plan). estimated_bytes is computed by the
+    # standardiser as n_atoms * n_frames * bytes_per_atom_per_frame.
+    _PLAN_TIER_1_KEYS = ("planner_mode", "source", "file_format", "request",
+                         "n_atoms", "n_frames", "bytes_per_atom_per_frame",
+                         "estimated_bytes")
+
+    # Plan keys the standardiser absorbs into the `sampling` sub-block when
+    # present (stochastic mode only).
+    _PLAN_SAMPLING_KEYS = frozenset({
+        "n_lines_sampled", "n_lines_eligible", "n_lines_matching",
+        "n_atoms_sampled", "n_atoms_matched",
+        "rng_seed", "target_sample_size", "sample_probability",
+    })
+
+    # Plan keys the standardiser intentionally drops from raw_plan (legacy
+    # noise or values now sourced authoritatively elsewhere).
+    _PLAN_DROP_KEYS = frozenset({
+        "file_type",                # superseded by file_format
+        "estimated_mib",            # standardiser only exposes estimated_bytes
+        "bytes_per_atom_per_frame", # standardiser sources from plan_shape
+        "query_dictionary",         # the user passed it in; no need to echo it back
+    })
+
+
+    def _build_selection_block(self,
+                               *,
+                               merge_mode: str,
+                               type_q_provided: bool,
+                               topo_q_provided: bool,
+                               traj_q_provided: bool,
+                               type_ids,
+                               topo_ids,
+                               traj_ids,
+                               resolved_count) -> dict:
+        '''
+        Build the selection sub-envelope. Schema is identical for every mode;
+        select() simply passes empty contents with merge_mode="none".
+
+        Parameters
+        ----------
+        merge_mode : str
+            "intersection" for positions()/fetch(), "none" for select().
+        type_q_provided, topo_q_provided, traj_q_provided : bool
+            Whether the user passed a query dict for that domain.
+        type_ids, topo_ids, traj_ids : list[int] | None
+            The id sets each domain contributed to the intersection. None
+            means the domain did not contribute (e.g. DCD hotpath returns
+            no constraint even when a query is provided).
+        resolved_count : int | None
+            Size of the final intersected selection. None for select() and
+            for positions()/fetch() calls with no domain constraints.
+
+        Returns
+        -------
+        dict
+            Selection block in the standardised schema.
+        '''
+
+        def _domain_block(query_provided: bool, ids):
+            return {
+                "query_provided": bool(query_provided),
+                "ids_provided":   ids is not None,
+                "n_matched":      (len(ids) if ids is not None else None),
+            }
+
+        return {
+            "merge_mode":     merge_mode,
+            "typing":         _domain_block(type_q_provided, type_ids),
+            "topology":       _domain_block(topo_q_provided, topo_ids),
+            "trajectory":     _domain_block(traj_q_provided, traj_ids),
+            "resolved_count": resolved_count,
+        }
+
+
+    def _standardise_metadata(self,
+                              domain: str,
+                              file_path,
+                              file_format: str,
+                              raw_meta: dict) -> dict:
+        '''
+        Build the standardised metadata dict for a single loaded domain.
+
+        Parameters
+        ----------
+        domain : str
+            One of "typing", "topology", "trajectory".
+        file_path : str | Path
+            Path to the file backing this domain.
+        file_format : str
+            File extension without the leading dot (e.g. "pdb", "dcd").
+        raw_meta : dict
+            Raw metadata dict from the parser's _update_*_globals_* function.
+            May be empty.
+
+        Returns
+        -------
+        dict
+            Standardised metadata envelope. Tier-1 keys are guaranteed
+            present; tier-2 keys are present only when meaningful;
+            format-unique keys land in `format_specific` if any remain.
+
+        Raises
+        ------
+        ValueError
+            If a tier-1 key required by the domain cannot be resolved from
+            raw_meta.
+        '''
+
+        # Canonicalise alias keys up-front so downstream lookups are uniform.
+        canonical_meta: dict = {}
+        for k, v in (raw_meta or {}).items():
+            canonical_key = self._METADATA_KEY_ALIASES.get(k, k)
+            # If both alias and canonical present, canonical wins.
+            if canonical_key not in canonical_meta or canonical_meta[canonical_key] is None:
+                canonical_meta[canonical_key] = v
+
+        file_path = Path(file_path)
+        try:
+            file_size_bytes = file_path.stat().st_size
+        except OSError:
+            file_size_bytes = None
+
+        # -------------------- tier 1 --------------------
+        out: dict = {
+            "source":          domain,
+            "file_path":       str(file_path),
+            "file_format":     file_format,
+            "file_size_bytes": file_size_bytes,
+        }
+
+        n_atoms = canonical_meta.get("n_atoms")
+        if n_atoms is None:
+            raise ValueError(
+                f"Metadata contract violated: parser '{file_format}' did not report "
+                f"'n_atoms' (or alias 'num_atoms') for domain '{domain}'. "
+                f"Tier-1 metadata keys must be reported by every parser."
+            )
+        out["n_atoms"] = int(n_atoms)
+
+        if domain == "trajectory":
+            n_frames = canonical_meta.get("n_frames")
+            if n_frames is None:
+                raise ValueError(
+                    f"Metadata contract violated: parser '{file_format}' did not "
+                    f"report 'n_frames' (or alias 'num_frames') for trajectory domain. "
+                    f"Tier-1 metadata keys must be reported by every parser."
+                )
+            out["n_frames"] = int(n_frames)
+
+        # -------------------- tier 2 --------------------
+        consumed = {"n_atoms", "n_frames"}
+        for key in self._METADATA_TIER_2_KEYS:
+            if key in canonical_meta and canonical_meta[key] is not None:
+                out[key] = canonical_meta[key]
+                consumed.add(key)
+
+        # -------------------- tier 3 (format_specific) --------------------
+        format_specific = {
+            k: v for k, v in canonical_meta.items()
+            if k not in consumed and v is not None
+        }
+        if format_specific:
+            out["format_specific"] = format_specific
+
+        return out
+
+
+    def _build_metadata_for_loaded_domains(self) -> dict:
+        '''
+        Build the metadata sub-envelope covering every currently loaded domain.
+
+        Returns
+        -------
+        dict
+            ``{domain: standardised_metadata_dict, ...}``. Domains without a
+            loaded file are omitted entirely (never present with None).
+        '''
+
+        metadata: dict = {}
+        for domain, cfg in self._domain_registry.items():
+            filepath = getattr(self, cfg["file_attr"])
+            if filepath is None:
+                continue
+
+            filetype = getattr(self, cfg["type_attr"])
+            fmt = filetype[1:]
+            module = self._get_parse_module(fmt)
+
+            update_fn = getattr(module, cfg["update_fn_template"].format(fmt=fmt), None)
+            raw_meta = update_fn(filepath) if update_fn is not None else {}
+            if not isinstance(raw_meta, dict):
+                raw_meta = {}
+
+            metadata[domain] = self._standardise_metadata(
+                domain=domain,
+                file_path=filepath,
+                file_format=fmt,
+                raw_meta=raw_meta,
+            )
+
+        return metadata
+
+
+    def _standardise_plan(self,
+                          domain: str,
+                          file_format: str,
+                          request: str,
+                          raw_plan: dict,
+                          plan_shape: tuple) -> dict:
+        
+        '''
+        Build the standardised plan dict for a single domain query.
+
+        Parameters
+        ----------
+        domain : str
+            One of "typing", "topology", "trajectory".
+        file_format : str
+            File extension without the leading dot.
+        request : str
+            The request string the planner was asked about.
+        raw_plan : dict
+            Raw planner output from the parser's _plan_*_query_* function.
+            Must include planner_mode, n_atoms, n_frames.
+        plan_shape : tuple
+            Output of the parser's _get_*_plan_shape_* function — a
+            3-tuple ``(output_kind, trailing_shape, bytes_per_match)``.
+            ``bytes_per_match`` is the authoritative source for
+            bytes_per_atom_per_frame; raw_plan values are ignored.
+
+        Returns
+        -------
+        dict
+            Standardised plan envelope with computed estimated_bytes.
+
+        Raises
+        ------
+        ValueError
+            If a tier-1 plan key is missing from raw_plan (excluding the
+            `supported: False` short-circuit case where only planner_mode and
+            reason are required), or if plan_shape reports no
+            bytes_per_match for a non-property request.
+        '''
+
+        if not isinstance(raw_plan, dict):
+            raise ValueError(
+                f"Plan contract violated: parser '{file_format}' planner for "
+                f"domain '{domain}' request '{request}' returned a "
+                f"{type(raw_plan).__name__}, expected dict."
+            )
+
+        planner_mode = raw_plan.get("planner_mode")
+        if planner_mode is None:
+            raise ValueError(
+                f"Plan contract violated: parser '{file_format}' planner did not "
+                f"report 'planner_mode' for domain '{domain}' request '{request}'."
+            )
+
+        # ---------------- unsupported short-circuit ----------------
+        if raw_plan.get("supported") is False:
+            base = {
+                "planner_mode": planner_mode,
+                "source":       domain,
+                "file_format":  file_format,
+                "request":      request,
+                "supported":    False,
+                "reason":       raw_plan.get("reason", "Planner does not support this request."),
+            }
+            consumed = {"planner_mode", "request", "source", "file_format",
+                        "supported", "reason"} | self._PLAN_DROP_KEYS
+            extras = {k: v for k, v in raw_plan.items() if k not in consumed and v is not None}
+            if extras:
+                base["format_specific"] = extras
+            return base
+
+        # ---------------- tier 1 (supported branch) ----------------
+        n_atoms = raw_plan.get("n_atoms")
+        if n_atoms is None:
+            raise ValueError(
+                f"Plan contract violated: parser '{file_format}' planner did not "
+                f"report 'n_atoms' for domain '{domain}' request '{request}'. "
+                f"All planners must report estimated/exact n_atoms at tier 1."
+            )
+
+        n_frames = raw_plan.get("n_frames")
+        if n_frames is None:
+            raise ValueError(
+                f"Plan contract violated: parser '{file_format}' planner did not "
+                f"report 'n_frames' for domain '{domain}' request '{request}'. "
+                f"Static (non-frame) data must report n_frames=1."
+            )
+
+        # bytes_per_atom_per_frame is sourced from plan_shape, not raw_plan.
+        # Any raw_plan value for this key is silently dropped (see _PLAN_DROP_KEYS).
+        bytes_per = plan_shape[2]
+        if bytes_per is None:
+            raise ValueError(
+                f"plan_shape contract violated: parser '{file_format}' "
+                f"_get_{domain}_plan_shape_{file_format} reported "
+                f"bytes_per_match=None for non-property request "
+                f"'{request}'. None is reserved for scalar_property "
+                f"requests, which should short-circuit before this point."
+            )
+
+        n_atoms_int = int(n_atoms)
+        n_frames_int = int(n_frames)
+        bytes_per_int = int(bytes_per)
+        estimated_bytes = n_atoms_int * n_frames_int * bytes_per_int
+
+        base: dict = {
+            "planner_mode":             planner_mode,
+            "source":                   domain,
+            "file_format":              file_format,
+            "request":                  request,
+            "n_atoms":                  n_atoms_int,
+            "n_frames":                 n_frames_int,
+            "bytes_per_atom_per_frame": bytes_per_int,
+            "estimated_bytes":          estimated_bytes,
+        }
+
+        # ---------------- tier 2 ----------------
+        if planner_mode == "stochastic":
+            if "confidence" in raw_plan and raw_plan["confidence"] is not None:
+                base["confidence"] = raw_plan["confidence"]
+
+            sampling = {
+                k: raw_plan[k] for k in self._PLAN_SAMPLING_KEYS
+                if k in raw_plan and raw_plan[k] is not None
+            }
+            if sampling:
+                base["sampling"] = sampling
+
+        # ---------------- tier 3 (format_specific) ----------------
+        consumed = (
+            set(self._PLAN_TIER_1_KEYS)
+            | {"confidence", "supported", "reason"}
+            | self._PLAN_SAMPLING_KEYS
+            | self._PLAN_DROP_KEYS
+        )
+        extras = {k: v for k, v in raw_plan.items() if k not in consumed and v is not None}
+        if extras:
+            base["format_specific"] = extras
+
+        return base
+
+
+    def _build_combined_plan_estimate(self, plan: dict) -> dict | None:
+        '''
+        Compute the cross-domain rollup estimate from per-domain plans.
+
+        Returns a sub-dict for ``plan["combined"]`` with two fields:
+
+        - ``n_atoms_upper_bound``: minimum n_atoms across all per-domain
+          plans. The true intersection size is bounded above by this.
+        - ``total_estimated_bytes``: assuming the upper bound holds, the
+          summed payload size across every requested domain
+          (``n_atoms_upper_bound * n_frames_d * bytes_per_atom_per_frame_d``
+          summed over domains).
+
+        Parameters
+        ----------
+        plan : dict
+            Per-domain plan dict, where keys are domain labels ("typing",
+            "topology", "trajectory") and values are standardised
+            per-domain plan dicts. May be empty.
+
+        Returns
+        -------
+        dict | None
+            The combined estimate, or None if `plan` is empty (no per-atom
+            requests issued — e.g. select() with property-only requests).
+        '''
+
+        if not plan:
+            return None
+
+        # Filter to plans with the supported tier-1 keys (skip any
+        # supported:False short-circuited entries that may have crept in).
+        valid = [p for p in plan.values()
+                 if isinstance(p, dict) and "n_atoms" in p and "n_frames" in p
+                 and "bytes_per_atom_per_frame" in p]
+
+        if not valid:
+            return None
+
+        n_atoms_upper_bound = min(p["n_atoms"] for p in valid)
+
+        total_estimated_bytes = sum(
+            n_atoms_upper_bound * p["n_frames"] * p["bytes_per_atom_per_frame"]
+            for p in valid
+        )
+
+        return {
+            "n_atoms_upper_bound":   n_atoms_upper_bound,
+            "total_estimated_bytes": int(total_estimated_bytes),
+        }
+
+
+    def _build_envelope(self,
+                        *,
+                        mode: str,
+                        selection: dict,
+                        metadata: dict,
+                        plan: dict,
+                        payload) -> dict:
+        '''
+        Assemble the five-key result envelope. Pure structural helper.
+        '''
+
+        return {
+            "mode":      mode,
+            "selection": selection,
+            "metadata":  metadata,
+            "plan":      plan,
+            "payload":   payload,
+        }
+
+
+    # -------------------------------------------------------------------------
     # INTERNAL DOMAIN EXECUTION
     # -------------------------------------------------------------------------
 
@@ -1099,7 +1635,13 @@ class sim():
                              request_string: str, ):
 
         '''
-        A function for creating a query plan for specified domain.
+        A function for creating a query plan for a specified domain.
+
+        Calls the parser's plan_shape function first; for scalar property
+        requests this short-circuits to None (no per-atom payload size to
+        estimate). For per-atom requests, calls the planner and routes the
+        result through the standardiser, which uses plan_shape's
+        bytes_per_match to compute estimated_bytes.
 
         Parameters:
         ----------
@@ -1112,7 +1654,9 @@ class sim():
 
         Returns:
         -------
-        The query plan for the specified domain.
+        dict | None
+            The standardised query plan for the specified domain, or None
+            if the request is a scalar property (no per-atom payload size).
         '''
 
         cfg = self._domain_registry[domain]
@@ -1124,8 +1668,18 @@ class sim():
         fmt = filetype[1:]
         module = self._get_parse_module(fmt)
 
-        query_fn = getattr(module, cfg["plan_fn_template"].format(fmt=fmt))
-        plan = query_fn(
+        # Plan shape first — anything without a per-atom-per-frame byte cost
+        # (scalar properties, selectors) has no payload size to estimate, so
+        # we skip the planner entirely and return None. The standardiser is
+        # only invoked for requests that yield a sized per-atom payload.
+        plan_shape_fn = getattr(module, cfg["plan_shape_fn_template"].format(fmt=fmt))
+        plan_shape = plan_shape_fn(request_string)
+
+        if plan_shape[2] is None:
+            return None
+
+        plan_fn = getattr(module, cfg["plan_fn_template"].format(fmt=fmt))
+        raw_plan = plan_fn(
             filepath,
             query_dictionary=query_dictionary,
             request_string=request_string,
@@ -1133,7 +1687,19 @@ class sim():
             requests_available=requests_available,
         )
 
-        return plan
+        # Route through the standardiser. Hard-fails if the parser violates
+        # the tier-1 plan contract. Returns the supported:False short-circuit
+        # envelope when the planner explicitly opts out.
+        standardised = self._standardise_plan(
+            domain=domain,
+            file_format=fmt,
+            request=request_string,
+            raw_plan=raw_plan,
+            plan_shape=plan_shape,
+        )
+        if standardised is not None and standardised.get("supported") is False:
+            return None
+        return standardised
 
     def _execute_domain_request(self,
                                 domain: str,
@@ -1144,6 +1710,17 @@ class sim():
         '''
         Internal function to execute a query on a specific domain (typing, topology, trajectory) 
         based on the provided query dictionary and request string.
+
+        Return shape contract
+        ---------------------
+        The parser returns its native bare value for the request — a list,
+        scalar, tuple, ndarray, or None. No wrapping, no metadata tuples.
+        Per-atom array payloads (positions, velocities) are returned as
+        ndarrays of shape ``(n_frames, n_atoms_selected, 3)``.
+
+        File-level metadata (frame counts, endian, etc.) is built
+        independently via ``_build_metadata_for_loaded_domains`` and is not
+        threaded through this layer.
 
         Parameters:
         ----------
@@ -1158,8 +1735,7 @@ class sim():
 
         Returns:
         -------
-        The output of the executed query, which can be a list of global indices, a property value, or a trajectory payload depending on the request.
-        
+        The parser's native return value (list, scalar, tuple, ndarray, or None).
         '''
 
         cfg = self._domain_registry[domain]
@@ -1459,74 +2035,6 @@ class sim():
             )
         return dict(query_dict)
 
-    def _resolve_atom_selection(self,
-                                TYPE_Q: dict = None,
-                                TOPO_Q: dict = None,
-                                updateFlag: bool = False):
-        '''
-        Resolve atom global_ids from typing and/or topology queries.
-
-        Combination rules:
-        ------------------
-        - type only      -> use type globals
-        - topology only  -> use topology globals
-        - both provided  -> use intersection
-
-        Parameters:
-        ----------
-        TYPE_Q, TOPO_Q : dict, optional
-            Query dictionaries for typing and topology.
-
-        updateFlag : bool, default=False
-            Passed through to the underlying domain handlers.
-
-        Returns:
-        -------
-        list[int]
-            Sorted global_ids defining the atom selection.
-        '''
-
-        globals_from_type = None
-        globals_from_topo = None
-
-        if TYPE_Q is not None:
-            globals_from_type = self.get_types(
-                QUERY=TYPE_Q,
-                REQUEST="global_ids",
-                updateFlag=updateFlag,
-            )
-
-        if TOPO_Q is not None:
-            globals_from_topo = self.get_topology(
-                QUERY=TOPO_Q,
-                REQUEST="global_ids",
-                updateFlag=updateFlag,
-            )
-
-        if globals_from_type is None and globals_from_topo is None:
-            raise ValueError(
-                "Atom selection failed: neither typing nor topology produced global_ids."
-            )
-
-        if globals_from_type is None:
-            selected_globals = sorted(globals_from_topo)
-
-        elif globals_from_topo is None:
-            selected_globals = sorted(globals_from_type)
-
-        else:
-            selected_globals = sorted(set(globals_from_type) & set(globals_from_topo))
-
-        if not selected_globals:
-            print(globals_from_type)
-            print(globals_from_topo)
-            raise ValueError(
-                "Typing and topology selections produced an empty intersection."
-            )   
-        
-
-        return selected_globals
-
 
     # -------------------------------------------------------------------------
     # MISC SUPPORT FUNCTIONALITY
@@ -1787,6 +2295,7 @@ class sim():
         required = [
             cfg["keys_fn_template"].format(fmt=fmt),
             cfg["plan_fn_template"].format(fmt=fmt),
+            cfg["plan_shape_fn_template"].format(fmt=fmt),
             cfg["query_fn_template"].format(fmt=fmt),
             cfg["update_fn_template"].format(fmt=fmt),
         ]

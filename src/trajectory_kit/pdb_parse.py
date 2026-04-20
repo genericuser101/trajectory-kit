@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 
 # local imports
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 
 # -------------------------------------------------------------------------
@@ -173,20 +173,19 @@ def _plan_type_query_pdb(
             f'Available requests: {sorted(requests_available)}'
         )
 
-    output_kind, trailing_shape, bytes_per_match = _get_pdb_request_plan_shape(request_string)
+    output_kind, trailing_shape, bytes_per_match = _get_type_plan_shape_pdb(request_string)
 
-    # property requests are not estimated from stochastic atom matching
+    # Scalar property requests are short-circuited centrally by
+    # _plan_domain_request via the plan_shape function, so they should never
+    # reach this planner. The check below is defensive only.
     if output_kind == 'scalar_property':
         return {
             'planner_mode': 'stochastic',
-            'file_type': 'pdb',
-            'request': request_string,
-            'supported': False,
+            'supported':    False,
             'reason': (
                 f'Stochastic payload estimation is only implemented for per-atom '
                 f'requests. Request {request_string!r} is a scalar/system property.'
             ),
-            'query_dictionary': query_dictionary,
         }
 
     predicate_state = _get_pdb_type_predicate_state(query_dictionary)
@@ -226,12 +225,6 @@ def _plan_type_query_pdb(
     estimated_matches = estimated_eligible_records * matching_fraction_given_eligible
 
     estimated_matches_int = int(round(estimated_matches))
-    estimated_payload_bytes = int(round(estimated_matches * bytes_per_match))
-
-    if trailing_shape == ():
-        estimated_output_shape = (estimated_matches_int,)
-    else:
-        estimated_output_shape = (estimated_matches_int, *trailing_shape)
 
     if n_sampled_eligible == 0:
         confidence = 'none'
@@ -248,8 +241,7 @@ def _plan_type_query_pdb(
         "n_lines_eligible": n_sampled_eligible,
         "n_lines_matching": n_matching_sampled,
         "n_atoms":          estimated_matches_int,
-        "estimated_bytes":  estimated_payload_bytes,
-        "estimated_mib":    estimated_payload_bytes / (1024 ** 2),
+        "n_frames":         1,
         "confidence":       confidence,
     }
 
@@ -478,7 +470,7 @@ def _get_topology_query_pdb(
 # -------------------------------------------------------------------------
 
 
-def _get_pdb_request_plan_shape(request_string: str) -> tuple[str, tuple | None, int | None]:
+def _get_type_plan_shape_pdb(request_string: str) -> tuple[str, tuple | None, int | None]:
 
     '''
     Return output_kind, trailing_shape, and bytes_per_match for planner use.
@@ -602,6 +594,7 @@ def _get_pdb_type_predicate_state(query_dictionary: dict) -> dict:
     resn_inc, resn_exc = qh._normalise_query_pair(query_dictionary.get('residue_name'))
     seg_inc,  seg_exc  = qh._normalise_query_pair(query_dictionary.get('segment_name'))
 
+    gid_inc,  gid_exc  = qh._normalise_query_pair(query_dictionary.get('global_ids'),        range_style=True)
     li_inc,   li_exc   = qh._normalise_query_pair(query_dictionary.get('local_ids'),         range_style=True)
     ri_inc,   ri_exc   = qh._normalise_query_pair(query_dictionary.get('residue_ids'),       range_style=True)
     occ_inc,  occ_exc  = qh._normalise_query_pair(query_dictionary.get('occupancy'),         range_style=True)
@@ -618,6 +611,8 @@ def _get_pdb_type_predicate_state(query_dictionary: dict) -> dict:
         'resn_exc': resn_exc,
         'seg_inc': seg_inc,
         'seg_exc': seg_exc,
+        'gid_inc': gid_inc,
+        'gid_exc': gid_exc,
         'li_inc': li_inc,
         'li_exc': li_exc,
         'ri_inc': ri_inc,
@@ -635,13 +630,14 @@ def _get_pdb_type_predicate_state(query_dictionary: dict) -> dict:
         'need_atom': bool(atom_inc or atom_exc),
         'need_resn': bool(resn_inc or resn_exc),
         'need_seg': bool(seg_inc or seg_exc),
-        'need_li': li_inc != (None, None) or li_exc != (None, None),
-        'need_ri': ri_inc != (None, None) or ri_exc != (None, None),
-        'need_occ': occ_inc != (None, None) or occ_exc != (None, None),
-        'need_temp': temp_inc != (None, None) or temp_exc != (None, None),
-        'need_x': x_inc != (None, None) or x_exc != (None, None),
-        'need_y': y_inc != (None, None) or y_exc != (None, None),
-        'need_z': z_inc != (None, None) or z_exc != (None, None),
+        'need_gid': bool(gid_inc or gid_exc),
+        'need_li': bool(li_inc or li_exc),
+        'need_ri': bool(ri_inc or ri_exc),
+        'need_occ': bool(occ_inc or occ_exc),
+        'need_temp': bool(temp_inc or temp_exc),
+        'need_x': bool(x_inc or x_exc),
+        'need_y': bool(y_inc or y_exc),
+        'need_z': bool(z_inc or z_exc),
     }
 
 
@@ -674,7 +670,13 @@ def _pdb_atom_matches_query(atom: dict, predicate_state: dict) -> bool:
 
     ok = True
 
-    if predicate_state['need_li']:
+    # global_ids first: most selective, exact integer match by id
+    if predicate_state['need_gid']:
+        ok = match_range(atom['global_id'],
+                             predicate_state['gid_inc'],
+                             predicate_state['gid_exc'])
+
+    if ok and predicate_state['need_li']:
         ok = match_range(atom['local_id'],
                              predicate_state['li_inc'],
                              predicate_state['li_exc'])

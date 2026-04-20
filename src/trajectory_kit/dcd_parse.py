@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 
 # local imports
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 
 # -------------------------------------------------------------------------
@@ -91,15 +91,10 @@ def _plan_trajectory_query_dcd(
 
     n_frames_selected = (stop - start + step - 1) // step
 
-    n_atoms_selected = len(query_dictionary.get("global_ids", ([], set()))[0])
-    estimated_payload_bytes = n_frames_selected * n_atoms_selected * 3 * 4  # float32
-
     return {
-        "planner_mode":    "header",
-        "n_atoms":         n_atoms_selected,
-        "n_frames":        n_frames_selected,
-        "estimated_bytes": estimated_payload_bytes,
-        "estimated_mib":   estimated_payload_bytes / (1024 ** 2),
+        "planner_mode": "header",
+        "n_atoms":      natom,
+        "n_frames":     n_frames_selected,
     }
 
 
@@ -114,12 +109,10 @@ def _get_trajectory_query_dcd(
     match request_string:
 
         case "global_ids":
-            # DCD encodes only positional data — no per-atom properties to
-            # query against. Return None to signal no atom constraint.
-            # Future formats with per-frame properties return
-            # list[None | list[int]] here instead.
-
-            
+            # DCD has no per-frame per-atom properties to filter on.
+            # Return None to signal "no constraint from this domain" —
+            # fetch() treats None as a hotpath meaning atom selection is
+            # fully delegated to the typing / topology domain.
             return None
 
         case "positions":
@@ -144,7 +137,7 @@ def _get_trajectory_query_dcd(
 # -------------------------------------------------------------------------
 
 
-def _get_trajectory_request_plan_shape_dcd(request_string: str) -> tuple[str, tuple, int | None]:
+def _get_trajectory_plan_shape_dcd(request_string: str) -> tuple[str, tuple, int | None]:
 
     '''
     Return output_kind, trailing_shape, and bytes_per_entry for planner use.
@@ -302,8 +295,6 @@ def _read_dcd_positions_timeline(
         pos_out = np.empty((n_keep, len(gids), 3), dtype=np.float32)
 
         out_i = 0
-        first_frame_read = None
-        last_frame_read = None
 
         for frame_i in range(nset):
             if frame_i < start:
@@ -325,10 +316,6 @@ def _read_dcd_positions_timeline(
             if skip:
                 continue
 
-            if first_frame_read is None:
-                first_frame_read = frame_i
-            last_frame_read = frame_i
-
             x = np.frombuffer(xrec, dtype=endian + "f4", count=natom)
             y = np.frombuffer(yrec, dtype=endian + "f4", count=natom)
             z = np.frombuffer(zrec, dtype=endian + "f4", count=natom)
@@ -339,15 +326,4 @@ def _read_dcd_positions_timeline(
 
             out_i += 1
 
-        meta = {
-            "first_frame_read": first_frame_read,
-            "last_frame_read": last_frame_read,
-            "n_frames_read": out_i,
-            "start": start,
-            "stop": stop,
-            "step": step,
-            "start_inclusive": True,
-            "stop_inclusive": False,
-        }
-
-        return pos_out[:out_i], meta
+        return pos_out[:out_i]

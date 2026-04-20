@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 
 # local imports
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 # -------------------------------------------------------------------------
 # TOPOLOGY PARSING
@@ -155,35 +155,31 @@ def _plan_topology_query_psf(
             f"Available requests: {sorted(requests_available)}"
         )
 
-    output_kind, trailing_shape, bytes_per_match = _get_psf_request_plan_shape(request_string)
+    output_kind, trailing_shape, bytes_per_match = _get_topology_plan_shape_psf(request_string)
 
+    # Scalar property requests are short-circuited centrally by
+    # _plan_domain_request via the plan_shape function. Defensive only.
     if output_kind != "per_atom":
         return {
             "planner_mode": "stochastic",
-            "file_type": "psf",
-            "request": request_string,
-            "supported": False,
+            "supported":    False,
             "reason": (
                 f"Stochastic payload estimation is only implemented for per-atom "
                 f"requests. Request {request_string!r} is not a per-atom payload."
             ),
-            "query_dictionary": query_dictionary,
         }
 
-    bond_inc, bond_exc = query_dictionary.get("bonded_with", ([], []))
+    bond_inc, bond_exc = qh._normalise_bonded_with_pair(query_dictionary.get("bonded_with"))
     need_bonds = bool(bond_inc or bond_exc)
 
     if need_bonds:
         return {
             "planner_mode": "stochastic",
-            "file_type": "psf",
-            "request": request_string,
-            "supported": False,
+            "supported":    False,
             "reason": (
                 "PSF stochastic planning does not estimate bonded_with constraints. "
                 "Only direct atom-selection prevalence is estimated."
             ),
-            "query_dictionary": query_dictionary,
         }
 
     predicate_state = _get_psf_topology_predicate_state(
@@ -226,12 +222,6 @@ def _plan_topology_query_psf(
     estimated_matches = estimated_eligible_records * matching_fraction_given_eligible
 
     estimated_matches_int = int(round(estimated_matches))
-    estimated_payload_bytes = int(round(estimated_matches * bytes_per_match))
-
-    if trailing_shape == ():
-        estimated_output_shape = (estimated_matches_int,)
-    else:
-        estimated_output_shape = (estimated_matches_int, *trailing_shape)
 
     if n_sampled_eligible == 0:
         confidence = "none"
@@ -248,8 +238,7 @@ def _plan_topology_query_psf(
         "n_lines_eligible": n_sampled_eligible,
         "n_lines_matching": n_matching_sampled,
         "n_atoms":          estimated_matches_int,
-        "estimated_bytes":  estimated_payload_bytes,
-        "estimated_mib":    estimated_payload_bytes / (1024 ** 2),
+        "n_frames":         1,
         "confidence":       confidence,
     }
 
@@ -260,6 +249,9 @@ def _get_topology_query_psf(
     request_string,
     keywords_available,
     requests_available,
+    *,
+    _bonded_with_depth: int = 0,
+    _neighbor_cache: dict | None = None,
     ):
     
     '''
@@ -277,6 +269,19 @@ def _get_topology_query_psf(
         The set of valid query keys for this file.
     requests_available: set
         The set of valid request strings for this file.
+    _bonded_with_depth: int, default 0
+        Internal recursion counter for nested ``bonded_with`` neighbour
+        sub-queries. Defaults to 0 for user-facing calls; the parser
+        increments it when recursing through ``_resolve_neighbor_set``.
+        Capped at ``qh.MAX_BONDED_WITH_DEPTH`` (16); deeper queries raise
+        ``RecursionError``.
+    _neighbor_cache: dict | None, default None
+        Internal call-spanning cache for resolved neighbour sets. The
+        top-level call (``_bonded_with_depth == 0``) allocates a fresh dict;
+        recursive calls reuse the parent's cache so identical neighbour
+        sub-queries at any depth are resolved exactly once per user call.
+        The cache is per-call — a fresh one is allocated for every
+        user-facing entry point (``positions()``, ``fetch()``, etc.).
  
     Returns:
     -------
@@ -290,7 +295,16 @@ def _get_topology_query_psf(
         If the request_string is recognised but not yet implemented.
     ValueError
         If the request_string is not supported.
+    RecursionError
+        If nested bonded_with neighbour resolution exceeds
+        ``qh.MAX_BONDED_WITH_DEPTH``.
     '''
+
+    # Allocate a fresh neighbour cache at the top-level entry point so that
+    # all recursion from this user call shares one cache. Recursive calls
+    # must pass the same cache through; never reuse across user calls.
+    if _neighbor_cache is None:
+        _neighbor_cache = {}
  
     def _atoms_iter():
 
@@ -325,23 +339,12 @@ def _get_topology_query_psf(
         ValueError
             If bond constraint blocks are malformed.
         '''
-        bond_inc, bond_exc = query_dictionary.get("bonded_with", ([], []))
+        bond_inc, bond_exc = qh._normalise_bonded_with_pair(query_dictionary.get("bonded_with"))
         bond_mode, _ = query_dictionary.get("bonded_with_mode", ("all", None))
  
         if not bond_inc and not bond_exc:
             return base_ids
- 
-        def _freeze(obj):
-            if isinstance(obj, dict):
-                return tuple(sorted((k, _freeze(v)) for k, v in obj.items()))
-            if isinstance(obj, (list, tuple)):
-                return tuple(_freeze(x) for x in obj)
-            if isinstance(obj, set):
-                return tuple(sorted(obj))
-            return obj
- 
-        neighbor_cache: dict[tuple, set[int]] = {}
- 
+
         def _resolve_neighbor_set(block: dict) -> set[int] | None:
             if block.get("total", False):
                 return None
@@ -350,21 +353,34 @@ def _get_topology_query_psf(
                 raise ValueError(
                     "bonded_with block must include 'neighbor' dict unless total=True."
                 )
+            # Recursion depth check — increment for the recursive call below.
+            next_depth = _bonded_with_depth + 1
+            if next_depth > qh.MAX_BONDED_WITH_DEPTH:
+                raise RecursionError(
+                    f"bonded_with neighbour recursion exceeded max depth of "
+                    f"{qh.MAX_BONDED_WITH_DEPTH}. Most realistic chemistry "
+                    f"queries require depth <= 5; check your query for "
+                    f"unintended deep nesting."
+                )
             neighbor_q = dict(neighbor_q)
-            neighbor_q.pop("bonded_with", None)
+            # Strip bonded_with_mode (parent-level orchestration concern).
+            # bonded_with itself is intentionally KEPT — neighbour sub-queries
+            # may carry their own bonded_with for graph-pattern matching.
             neighbor_q.pop("bonded_with_mode", None)
-            key = _freeze(neighbor_q)
-            if key in neighbor_cache:
-                return neighbor_cache[key]
+            key = qh._freeze_query(neighbor_q)
+            if key in _neighbor_cache:
+                return _neighbor_cache[key]
             ids = _get_topology_query_psf(
                 psf_filepath=psf_filepath,
                 query_dictionary=neighbor_q,
                 request_string="global_ids",
                 keywords_available=keywords_available,
                 requests_available=requests_available,
+                _bonded_with_depth=next_depth,
+                _neighbor_cache=_neighbor_cache,
             )
             s = set(ids)
-            neighbor_cache[key] = s
+            _neighbor_cache[key] = s
             return s
  
         neighbor_sets_inc = [_resolve_neighbor_set(b) for b in bond_inc]
@@ -381,140 +397,95 @@ def _get_topology_query_psf(
         )
  
         return [g for g, ok in zip(base_ids, bond_pass_mask) if ok]
+
+    def _matched_atoms():
+
+        '''
+        Yield full atom dicts for atoms passing BOTH the per-atom predicate
+        AND the bond filter (when bonded_with is in the query).
+
+        When no bonded_with is present, this streams atoms one by one with
+        no materialisation cost. When bonded_with is present, it materialises
+        the predicate-passing candidates once, resolves the bond filter
+        against them, and re-yields the survivors in original file order.
+
+        Every per-atom request branch consumes from this helper, so
+        bonded_with is uniformly enforced across all topology requests
+        rather than only for the global_ids branch.
+        '''
+        predicate_state = _get_psf_topology_predicate_state(
+            query_dictionary=query_dictionary,
+            keywords_available=keywords_available,
+        )
+
+        bond_inc, bond_exc = qh._normalise_bonded_with_pair(query_dictionary.get("bonded_with"))
+        has_bond_filter = bool(bond_inc or bond_exc)
+
+        if not has_bond_filter:
+            for atom in _atoms_iter():
+                if _psf_atom_matches_query(atom, predicate_state):
+                    yield atom
+            return
+
+        # Bond-filter path: materialise candidates so we can apply the
+        # bond constraint, then re-yield survivors in file order.
+        base_atoms = [
+            atom for atom in _atoms_iter()
+            if _psf_atom_matches_query(atom, predicate_state)
+        ]
+        base_ids = [atom["global_id"] for atom in base_atoms]
+        surviving = set(_resolve_global_ids_with_bonds(base_ids))
+
+        for atom in base_atoms:
+            if atom["global_id"] in surviving:
+                yield atom
  
     match request_string:
- 
+
         case "global_ids":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            base_ids = [
-                atom["global_id"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
-            return _resolve_global_ids_with_bonds(base_ids)
- 
+            return [atom["global_id"]    for atom in _matched_atoms()]
+
         case "local_ids":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["local_id"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["local_id"]     for atom in _matched_atoms()]
+
         case "residue_ids":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["residue_id"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["residue_id"]   for atom in _matched_atoms()]
+
         case "atom_names":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["atom_name"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["atom_name"]    for atom in _matched_atoms()]
+
         case "atom_types":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["atom_type"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["atom_type"]    for atom in _matched_atoms()]
+
         case "residue_names":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["residue_name"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["residue_name"] for atom in _matched_atoms()]
+
         case "segment_names":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["segment_name"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["segment_name"] for atom in _matched_atoms()]
+
         case "charges":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["charge"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["charge"]       for atom in _matched_atoms()]
+
         case "masses":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["mass"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["mass"]         for atom in _matched_atoms()]
+
         case "drude_alphas":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["drude_alpha"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["drude_alpha"]  for atom in _matched_atoms()]
+
         case "drude_tholes":
-            predicate_state = _get_psf_topology_predicate_state(
-                query_dictionary=query_dictionary,
-                keywords_available=keywords_available,
-            )
-            return [
-                atom["drude_thole"]
-                for atom in _atoms_iter()
-                if _psf_atom_matches_query(atom, predicate_state)
-            ]
- 
+            return [atom["drude_thole"]  for atom in _matched_atoms()]
+
         case "property-system_charge":
+            # Scalar system property — ignores per-atom predicate and bond
+            # filter by design; reports the total charge of the whole file.
             return sum(atom["charge"] for atom in _atoms_iter())
- 
+
         case "bonds_with":
             raise NotImplementedError(
                 "bonds_with payload return is not yet implemented. "
                 "Use bonded_with in the query_dictionary to filter atoms by bond graph."
             )
- 
+
         case _:
             raise ValueError(f"Unsupported request_string for PSF: {request_string!r}")
         
@@ -524,7 +495,7 @@ def _get_topology_query_psf(
 # -------------------------------------------------------------------------
 
 
-def _get_psf_request_plan_shape(request_string: str) -> tuple[str, tuple | None, int | None]:
+def _get_topology_plan_shape_psf(request_string: str) -> tuple[str, tuple | None, int | None]:
 
     '''
     Return output_kind, trailing_shape, and bytes_per_match for planner use.
@@ -609,6 +580,7 @@ def _is_psf_natom_record_line(line: str) -> bool:
 
 def _get_psf_topology_predicate_state(query_dictionary: dict, keywords_available: set) -> dict:
 
+    gid_inc,        gid_exc        = qh._normalise_query_pair(query_dictionary.get("global_ids"),   range_style=True)
     li_inc,         li_exc         = qh._normalise_query_pair(query_dictionary.get("local_ids"),    range_style=True)
     seg_inc,        seg_exc        = qh._normalise_query_pair(query_dictionary.get("segment_name"))
     ri_inc,         ri_exc         = qh._normalise_query_pair(query_dictionary.get("residue_ids"),  range_style=True)
@@ -629,6 +601,8 @@ def _get_psf_topology_predicate_state(query_dictionary: dict, keywords_available
     drude_thole_inc, drude_thole_exc = qh._normalise_query_pair(query_dictionary.get("drude_thole"), range_style=True)
 
     return {
+        "gid_inc": gid_inc,
+        "gid_exc": gid_exc,
         "li_inc": li_inc,
         "li_exc": li_exc,
         "seg_inc": seg_inc,
@@ -651,17 +625,18 @@ def _get_psf_topology_predicate_state(query_dictionary: dict, keywords_available
         "drude_alpha_exc": drude_alpha_exc,
         "drude_thole_inc": drude_thole_inc,
         "drude_thole_exc": drude_thole_exc,
-        "need_li": li_inc != (None, None) or li_exc != (None, None),
+        "need_gid": bool(gid_inc or gid_exc),
+        "need_li": bool(li_inc or li_exc),
         "need_seg": bool(seg_inc or seg_exc),
-        "need_ri": ri_inc != (None, None) or ri_exc != (None, None),
+        "need_ri": bool(ri_inc or ri_exc),
         "need_resn": bool(resn_inc or resn_exc),
         "need_atom": bool(atom_inc or atom_exc),
         "need_atomt": bool(atomt_inc or atomt_exc),
-        "need_charge": charge_inc != (None, None) or charge_exc != (None, None),
-        "need_mass": mass_inc != (None, None) or mass_exc != (None, None),
+        "need_charge": bool(charge_inc or charge_exc),
+        "need_mass": bool(mass_inc or mass_exc),
         "need_virt": bool(virt_inc or virt_exc),
-        "need_drude_alpha": has_alpha and (drude_alpha_inc != (None, None) or drude_alpha_exc != (None, None)),
-        "need_drude_thole": has_thole and (drude_thole_inc != (None, None) or drude_thole_exc != (None, None)),
+        "need_drude_alpha": has_alpha and bool(drude_alpha_inc or drude_alpha_exc),
+        "need_drude_thole": has_thole and bool(drude_thole_inc or drude_thole_exc),
     }
 
 
@@ -671,7 +646,11 @@ def _psf_atom_matches_query(atom: dict, predicate_state: dict) -> bool:
 
     ok = True
 
-    if predicate_state["need_li"]:
+    # global_ids first: most selective integer-id match
+    if predicate_state["need_gid"]:
+        ok = match_range(atom["global_id"], predicate_state["gid_inc"], predicate_state["gid_exc"])
+
+    if ok and predicate_state["need_li"]:
         ok = match_range(atom["local_id"], predicate_state["li_inc"], predicate_state["li_exc"])
     if ok and predicate_state["need_atom"]:
         ok = match_(atom["atom_name"], predicate_state["atom_inc"], predicate_state["atom_exc"])
@@ -919,198 +898,3 @@ def _build_local_to_global_to_type_map(psf_filepath: str | Path):
     return local_global_ntype, ntype_to_type
 
 
-# -------------------------------------------------------------------------
-# ARCHIVED
-# -------------------------------------------------------------------------
-
-'''
-
-def ARCHIVE_filter_by_bonded_with(psf_filepath: str | Path,
-                           candidate_globals: list[int],
-                           bonded_with_inc: list[dict],
-                           bonded_with_exc: list[dict],
-                           mode: str,) -> set[int]:
-    
-    
-    #############################################################################################
-    #  THIS IS VOID AND A GENERAL NEIGHBOUR FINDER HAS BEEN IMPLEMENTED USING RECURSIVE CHECKS  #
-    #############################################################################################
-
-    This function filters a list of candidate global atom indices based on their bonded neighbors and the specified bonded_with constraints.
-
-    Parameters:
-    ----------
-    psf_filepath: str | Path
-        The file path to the psf file. This is required and should be a .psf file.
-    candidate_globals: list[int]
-        A list of global atom indices to filter based on their bonded neighbors.
-    bonded_with_inc: list[dict]
-        A list of bonded_with constraints for inclusion. Each constraint is a dict that specifies the required number of bonded neighbors and their atom types. See the README for the format of these dicts.
-    bonded_with_exc: list[dict]
-        A list of bonded_with constraints for exclusion. Each constraint is a dict that specifies the required number of bonded neighbors and their atom types. See the README for the format of these dicts.
-    mode: str
-        The mode for evaluating the bonded_with constraints. Must be either "all" (the atom must satisfy all inclusion constraints and none of the exclusion constraints) 
-        or "any" (the atom must satisfy at least one inclusion constraint and none of the exclusion constraints).
-
-    Returns:
-    -------
-    set[int]
-        A set of global atom indices from the candidate_globals that satisfy the bonded_with constraints according to the specified mode.
-    
-
-    if mode not in ("all", "any"):
-        raise ValueError("bonded_with_mode must be 'all' or 'any'.")
-
-    if not candidate_globals:
-        return set()
-
-    # local_id -> (global_id, atom_type_int); atom_type_int -> atom_type_str
-    local_to_glob_ntype, ntype_to_type = _build_local_to_global_to_type_map(psf_filepath)
-    type_to_ntype = {v: k for k, v in ntype_to_type.items()}
-
-    cand_set = set(candidate_globals)
-    cand_index = {g: i for i, g in enumerate(candidate_globals)}
-    n_cand = len(candidate_globals)
-
-    def _parse_count_cmp(count_dict: dict) -> tuple[str, int]:
-        if not isinstance(count_dict, dict) or len(count_dict) != 1:
-            raise ValueError("count must be a dict with exactly one comparator key.")
-        (k, v), = count_dict.items()
-        if k not in ("eq", "ne", "ge", "le", "gt", "lt"):
-            raise ValueError(f"Unsupported comparator: {k!r}")
-        if not isinstance(v, int) or v < 0:
-            raise ValueError("count comparator value must be a non-negative int.")
-        return k, v
-
-    def _cmp(x: int, op: str, v: int) -> bool:
-        if op == "eq": return x == v
-        if op == "ne": return x != v
-        if op == "ge": return x >= v
-        if op == "le": return x <= v
-        if op == "gt": return x > v
-        if op == "lt": return x < v
-        raise ValueError(f"Unknown op: {op!r}")
-
-    # Normalize constraints to either:
-    #   ("total", op, val)
-    #   ("type", ntype_int, op, val)
-    def _norm_one(c: dict) -> tuple:
-        if not isinstance(c, dict):
-            raise ValueError("bonded_with constraints must be dicts (PSF canonical format).")
-        if "count" not in c:
-            raise ValueError("bonded_with constraint missing 'count'.")
-
-        op, val = _parse_count_cmp(c["count"])
-
-        if c.get("total", False):
-            return ("total", op, val)
-
-        neighbor = c.get("neighbor")
-        if not isinstance(neighbor, dict):
-            raise ValueError("bonded_with constraint missing 'neighbor' dict (or set total=True).")
-
-        if "atom_type" not in neighbor:
-            raise ValueError("bonded_with.neighbor must include 'atom_type' selector.")
-
-        atom_type_sel = neighbor["atom_type"]
-        if not (isinstance(atom_type_sel, tuple) and len(atom_type_sel) == 2):
-            raise ValueError("neighbor['atom_type'] must be (include_set, exclude_set).")
-
-        inc_set, exc_set = atom_type_sel
-        if not isinstance(inc_set, set) or not isinstance(exc_set, set):
-            raise ValueError("neighbor['atom_type'] must be (set, set).")
-
-        if exc_set:
-            raise ValueError("neighbor['atom_type'] exclude set not supported in bonded_with yet.")
-        if len(inc_set) != 1:
-            raise ValueError("neighbor['atom_type'] include set must have exactly one atom type.")
-
-        (type_str,) = tuple(inc_set)
-        if type_str not in type_to_ntype:
-            raise ValueError(f"Unknown atom_type in bonded_with: {type_str!r}")
-
-        return ("type", type_to_ntype[type_str], op, val)
-
-    inc = [_norm_one(c) for c in (bonded_with_inc or [])]
-    exc = [_norm_one(c) for c in (bonded_with_exc or [])]
-
-    if not inc and not exc:
-        return set(candidate_globals)
-
-    needed_ntypes = sorted({c[1] for c in (inc + exc) if c[0] == "type"})
-    ntype_to_col = {nt: j for j, nt in enumerate(needed_ntypes)}
-
-    counts_total = np.zeros(n_cand, dtype=np.int32)
-    counts_by_type = np.zeros((n_cand, len(needed_ntypes)), dtype=np.int32) if needed_ntypes else None
-
-    def _int_stream_after_nbonds(f):
-        for line in f:
-            if "!NBOND" in line:
-                nbond = int(line.split()[0])
-                need = 2 * nbond
-                got = 0
-                while got < need:
-                    row = f.readline()
-                    if not row:
-                        break
-                    for tok in row.split():
-                        yield int(tok)
-                        got += 1
-                        if got >= need:
-                            return
-                return
-        raise ValueError("!NBOND section not found in PSF.")
-
-    with open(psf_filepath, "r", encoding="ascii", errors="replace") as f:
-        ints = _int_stream_after_nbonds(f)
-        for a_local, b_local in zip(ints, ints):
-            a_g, a_nt = local_to_glob_ntype[a_local]
-            b_g, b_nt = local_to_glob_ntype[b_local]
-
-            if a_g in cand_set:
-                i = cand_index[a_g]
-                counts_total[i] += 1
-                if counts_by_type is not None:
-                    col = ntype_to_col.get(b_nt)
-                    if col is not None:
-                        counts_by_type[i, col] += 1
-
-            if b_g in cand_set:
-                i = cand_index[b_g]
-                counts_total[i] += 1
-                if counts_by_type is not None:
-                    col = ntype_to_col.get(a_nt)
-                    if col is not None:
-                        counts_by_type[i, col] += 1
-
-    def _eval(i: int, c: tuple) -> bool:
-        if c[0] == "total":
-            _, op, v = c
-            return _cmp(int(counts_total[i]), op, v)
-        _, nt, op, v = c
-        return _cmp(int(counts_by_type[i, ntype_to_col[nt]]), op, v)
-
-    out: set[int] = set()
-
-    for i, g in enumerate(candidate_globals):
-        # include
-        if inc:
-            if mode == "all":
-                inc_ok = all(_eval(i, c) for c in inc)
-            else:
-                inc_ok = any(_eval(i, c) for c in inc)
-        else:
-            inc_ok = True
-
-        if not inc_ok:
-            continue
-
-        # exclude: any match rejects
-        if any(_eval(i, c) for c in exc):
-            continue
-
-        out.add(g)
-
-    return out
-
-'''

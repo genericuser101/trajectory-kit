@@ -141,8 +141,8 @@ Bounds are inclusive. Either bound can be `None` for open-ended ranges:
 # CA or CB atoms, in PROT segment, x between 0 and 20 Å, not in residues 8–12
 {
     "atom_name":    {"CA", "CB"},
-    "segment_name": ({"PROT"}, {}),
-    "x":            ((0.0, 20.0), None),
+    "segment_name": {"PROT"},
+    "x":            (0.0, 20.0),
     "residue_ids":  (None, (8, 12)),
 }
 ```
@@ -158,20 +158,19 @@ Topology queries can filter by bond graph — useful for identifying chemical en
 ```python
 # atoms with exactly 4 bonds (tetrahedral carbon)
 {
-    "bonded_with": ([{"total": True, "count": {"eq": 4}}], []),
-    "bonded_with_mode": ("all", None),
+    "bonded_with": {"total": True, "count": {"eq": 4}},
+    "bonded_with_mode": "all",
 }
 
 # carbonyl carbons: 1 bond to CD2O2A, 3 bonds to CG2R61
 {
     "bonded_with": (
         [
-            {"neighbor": {"atom_type": ({"CD2O2A"}, {})}, "count": {"eq": 1}},
-            {"neighbor": {"atom_type": ({"CG2R61"}, {})}, "count": {"eq": 3}},
+            {"neighbor": {"atom_type": "CD2O2A"}, "count": {"eq": 1}},
+            {"neighbor": {"atom_type": "CG2R61"}, "count": {"eq": 3}},
         ],
-        [],
     ),
-    "bonded_with_mode": ("all", None),
+    "bonded_with_mode": "all",
 }
 ```
 
@@ -186,7 +185,7 @@ Supported comparators: `eq`, `ne`, `ge`, `le`, `gt`, `lt`.
 |------------|-------------------|
 | Typing     | `.pdb`, `.xyz`, `.mae` |
 | Topology   | `.psf`, `.mae`    |
-| Trajectory | `.dcd`            |
+| Trajectory | `.dcd`, `.coor`            |
 
 ### Dual-domain files
 
@@ -197,39 +196,6 @@ my_sim = sim(typing="system.mae", topology="system.mae")
 ```
 
 trajectory-kit loads the file once per domain, so each slot gets the appropriate keyword and request set for that domain. Atom count consistency is validated automatically across all loaded files.
-
----
-
-## Adding a New Format
-
-Write a single `{fmt}_parse.py` file with four functions:
-
-| Function | Purpose |
-|----------|---------|
-| `_get_{domain}_keys_reqs_{fmt}` | Return available query keywords and request strings |
-| `_plan_{domain}_query_{fmt}` | Return a stochastic execution plan without reading the full file |
-| `_get_{domain}_query_{fmt}` | Execute a query and return the result |
-| `_update_{domain}_globals_{fmt}` | Extract global system properties (atom count, box size, etc.) |
-
-Add the file extension to the domain registry in `main.py`. No other changes required — the architecture validates the contract at import time and raises a clear error if any function is missing.
-
----
-
-## Support Roadmap
-
-### Typing
-
-### Topology
-
-- **.pdb**: Using the CONNECT keyword to build a topology similar to psf and allow for bond query parsing.
-
-### Trajectories
-
-- **.traj**: Trajectory file.
-
-- **.coor**: Trajectory file.
-
-- **.thermal**: LAMMPS trajectory information file.
 
 ---
 

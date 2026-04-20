@@ -6,9 +6,8 @@ from pathlib import Path
 import numpy as np
 
 # local imports
-from trajectory_kit import file_parse_help as fph
-from trajectory_kit import query_help as qh
-
+from trajectory_kit import _file_parse_help as fph
+from trajectory_kit import _query_help as qh
 
 # -------------------------------------------------------------------------
 # TYPE PARSING
@@ -165,19 +164,18 @@ def _plan_type_query_xyz(
             f"Available requests: {sorted(requests_available)}"
         )
 
-    output_kind, trailing_shape, bytes_per_match = _get_xyz_request_plan_shape(request_string)
+    output_kind, trailing_shape, bytes_per_match = _get_type_plan_shape_xyz(request_string)
 
+    # Scalar property requests are short-circuited centrally by
+    # _plan_domain_request via the plan_shape function. Defensive only.
     if output_kind == "scalar_property":
         return {
             "planner_mode": "stochastic",
-            "file_type": "xyz",
-            "request": request_string,
-            "supported": False,
+            "supported":    False,
             "reason": (
                 f"Stochastic payload estimation is only implemented for per-atom "
                 f"requests. Request {request_string!r} is a scalar/system property."
             ),
-            "query_dictionary": query_dictionary,
         }
 
     predicate_state = _get_xyz_type_predicate_state(query_dictionary)
@@ -217,12 +215,6 @@ def _plan_type_query_xyz(
     estimated_matches = estimated_eligible_records * matching_fraction_given_eligible
 
     estimated_matches_int = int(round(estimated_matches))
-    estimated_payload_bytes = int(round(estimated_matches * bytes_per_match))
-
-    if trailing_shape == ():
-        estimated_output_shape = (estimated_matches_int,)
-    else:
-        estimated_output_shape = (estimated_matches_int, *trailing_shape)
 
     if n_sampled_eligible == 0:
         confidence = "none"
@@ -239,8 +231,7 @@ def _plan_type_query_xyz(
         "n_lines_eligible": n_sampled_eligible,
         "n_lines_matching": n_matching_sampled,
         "n_atoms":          estimated_matches_int,
-        "estimated_bytes":  estimated_payload_bytes,
-        "estimated_mib":    estimated_payload_bytes / (1024 ** 2),
+        "n_frames":         1,
         "confidence":       confidence,
     }
 
@@ -392,7 +383,7 @@ def _get_type_query_xyz(
 # -------------------------------------------------------------------------
 
 
-def _get_xyz_request_plan_shape(request_string: str) -> tuple[str, tuple | None, int | None]:
+def _get_type_plan_shape_xyz(request_string: str) -> tuple[str, tuple | None, int | None]:
 
     '''
     Return output_kind, trailing_shape, and bytes_per_match for planner use.
@@ -523,6 +514,9 @@ def _get_xyz_type_predicate_state(query_dictionary: dict) -> dict:
     
     atom_inc, atom_exc = qh._normalise_query_pair(query_dictionary.get("atom_name"))
 
+    gid_inc, gid_exc = qh._normalise_query_pair(query_dictionary.get("global_ids"), range_style=True)
+    li_inc,  li_exc  = qh._normalise_query_pair(query_dictionary.get("local_ids"),  range_style=True)
+
     x_inc, x_exc = qh._normalise_query_pair(query_dictionary.get("x"), range_style=True)
     y_inc, y_exc = qh._normalise_query_pair(query_dictionary.get("y"), range_style=True)
     z_inc, z_exc = qh._normalise_query_pair(query_dictionary.get("z"), range_style=True)
@@ -530,6 +524,10 @@ def _get_xyz_type_predicate_state(query_dictionary: dict) -> dict:
     return {
         "atom_inc": atom_inc,
         "atom_exc": atom_exc,
+        "gid_inc": gid_inc,
+        "gid_exc": gid_exc,
+        "li_inc": li_inc,
+        "li_exc": li_exc,
         "x_inc": x_inc,
         "x_exc": x_exc,
         "y_inc": y_inc,
@@ -537,9 +535,11 @@ def _get_xyz_type_predicate_state(query_dictionary: dict) -> dict:
         "z_inc": z_inc,
         "z_exc": z_exc,
         "need_atom": bool(atom_inc or atom_exc),
-        "need_x": x_inc != (None, None) or x_exc != (None, None),
-        "need_y": y_inc != (None, None) or y_exc != (None, None),
-        "need_z": z_inc != (None, None) or z_exc != (None, None),
+        "need_gid": bool(gid_inc or gid_exc),
+        "need_li": bool(li_inc or li_exc),
+        "need_x": bool(x_inc or x_exc),
+        "need_y": bool(y_inc or y_exc),
+        "need_z": bool(z_inc or z_exc),
     }
 
 
@@ -555,7 +555,17 @@ def _xyz_atom_matches_query(atom: dict, predicate_state: dict) -> bool:
 
     ok = True
 
-    if predicate_state["need_atom"]:
+    # global_ids / local_ids first — most selective integer-id checks
+    if predicate_state["need_gid"]:
+        ok = match_range(atom["global_id"],
+                             predicate_state["gid_inc"],
+                             predicate_state["gid_exc"])
+    if ok and predicate_state["need_li"]:
+        ok = match_range(atom["local_id"],
+                             predicate_state["li_inc"],
+                             predicate_state["li_exc"])
+
+    if ok and predicate_state["need_atom"]:
         ok = match_(atom["atom_name"],
                     predicate_state["atom_inc"],
                     predicate_state["atom_exc"])
