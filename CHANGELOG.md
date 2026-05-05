@@ -2,6 +2,26 @@
 
 All notable changes to trajectory-kit will be documented here.
 
+---
+
+## [0.4.0] — 2026-05-05 — POSITION WRITER ADDED
+
+### Added
+- `pos_writer` a set of functions for writing a new `.pdb` and `.xyz` file from a trajectory frame.
+- `tutorial_pos_writer.ipynb` has been added to guide the users through the `pos_writer` utility. 
+
+### Changed
+- stricter rules for `tests` and more unit tests were added. 
+- `tests` have become transparent, please test away to your hearts content.
+
+
+
+### Fixed
+- `.pdb` has gotten the `CONNECT` keyword, and has been added to the topology domain.
+
+
+### Current Issues
+
 
 ---
 
@@ -27,7 +47,6 @@ All notable changes to trajectory-kit will be documented here.
 ### Fixed
 - `.mea` Maestro format got unit tests.
 - `.mea` Maestro format inconsistencies changed to better suit the topology architecture.
-
 
 
 ### Current Issues

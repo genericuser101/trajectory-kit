@@ -79,7 +79,7 @@ class sim():
             },
 
             "topology": {
-                "supported_formats": {".psf", ".mae"},
+                "supported_formats": {".psf", ".mae", ".pdb"},
                 "file_attr": "top_file",
                 "type_attr": "top_type",
                 "keys_attr": "topo_file_keys",

@@ -184,7 +184,7 @@ Supported comparators: `eq`, `ne`, `ge`, `le`, `gt`, `lt`.
 | Domain     | Formats           |
 |------------|-------------------|
 | Typing     | `.pdb`, `.xyz`, `.mae` |
-| Topology   | `.psf`, `.mae`    |
+| Topology   | `.psf`, `.mae`,  `.pdb`   |
 | Trajectory | `.dcd`, `.coor`            |
 
 ### Dual-domain files
@@ -203,4 +203,4 @@ trajectory-kit loads the file once per domain, so each slot gets the appropriate
 
 stefan.zhikharev@warwick.ac.uk
 
-This project is maintained by one person. If you want a new feature or you don't like something just email me or write an issue its not that deep. Love, Stef.
+This project is maintained by one person. If you want a new feature or you don't like something just email me or write aits not that deep. Love, Stef.

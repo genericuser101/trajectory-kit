@@ -3,8 +3,7 @@ tests/test_paths.json
 .pytest_cache/
 
 # Development
-tests/*
-developer/*
+dev_hidden/*
 
 # Python
 __pycache__/
